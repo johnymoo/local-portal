@@ -7,7 +7,7 @@ export const SCHEMA_VERSION = 1;
 export const DEFAULT_CONFIG = {
   schemaVersion: SCHEMA_VERSION,
   apiPort: 7777,
-  apiBind: "127.0.0.1",
+  apiBind: "0.0.0.0",
   publicApiBase: null,
   guardPorts: [3000, 3001, 4200, 5000, 5173, 8000, 8080, 8888],
   allocRange: { start: 20000, end: 20999 },

@@ -114,6 +114,40 @@ test("load drops only the individually invalid record", () => {
   assert.ok(warnings.some((w) => w.includes("dropped 1 invalid record")));
 });
 
+test("load drops records with non-parseable timestamps", () => {
+  const filePath = tmpFile();
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(
+    filePath,
+    JSON.stringify({
+      schemaVersion: 1,
+      registrations: [
+        {
+          id: "reg_badtime",
+          name: "bad-time",
+          description: "",
+          port: 20001,
+          requestedPort: null,
+          status: "pending",
+          registeredAt: "not-a-date",
+          lastSeenListeningAt: null,
+          staleSince: null,
+          observedProcess: null,
+          meta: {},
+        },
+      ],
+    })
+  );
+
+  const warnings = [];
+  const registry = createRegistry({ filePath, log: { warn: (c, m) => warnings.push(m), error() {} } });
+  const result = registry.load();
+
+  assert.equal(result.loaded, 0);
+  assert.equal(registry.getByPort(20001), null);
+  assert.ok(warnings.some((w) => w.includes("dropped 1 invalid record")));
+});
+
 test("release removes a record and returns it", () => {
   const filePath = tmpFile();
   const registry = createRegistry({ filePath, now: () => 1_000_000 });

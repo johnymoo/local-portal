@@ -9,6 +9,11 @@ import { isListening, isPortFree, scanOnce } from "./scan.js";
 
 const VERSION = "1.0.0";
 
+function defaultApiBaseForDisplay(config) {
+  const host = config.apiBind === "0.0.0.0" || config.apiBind === "::" ? "127.0.0.1" : config.apiBind;
+  return `http://${host}:${config.apiPort}`;
+}
+
 function printUsage() {
   console.log(
     `Usage: local-portal [--config <path>] [--version] [--help]\n\n` +
@@ -87,7 +92,8 @@ export async function main(argv = process.argv.slice(2)) {
   const scanner = { isPortFree, isListening };
   const guards = createGuardManager({
     ports: config.guardPorts,
-    apiBase: config.publicApiBase || `http://127.0.0.1:${config.apiPort}`,
+    publicApiBase: config.publicApiBase,
+    apiPort: config.apiPort,
     log,
   });
   const allocator = createAllocator({
@@ -125,7 +131,7 @@ export async function main(argv = process.argv.slice(2)) {
     process.exitCode = 1;
     return;
   }
-  log.info("main", `API listening on http://${config.apiBind}:${config.apiPort}`);
+  log.info("main", `API listening on ${defaultApiBaseForDisplay(config)} (bind ${config.apiBind}:${config.apiPort})`);
 
   lastScan = await scanOnce({ log });
 
@@ -196,7 +202,7 @@ export async function main(argv = process.argv.slice(2)) {
     log.info(
       "main",
       `ready | config: ${configPath} | registry: ${registryPath} | ` +
-        `api: http://127.0.0.1:${config.apiPort} | guards held: [${held.join(", ")}] | ` +
+        `api: ${defaultApiBaseForDisplay(config)} | bind: ${config.apiBind}:${config.apiPort} | guards held: [${held.join(", ")}] | ` +
         `guards wanted (occupied by others, will retry): [${wanted.join(", ") || "none"}] | ` +
         `registrations: ${JSON.stringify(byStatus)}`
     );

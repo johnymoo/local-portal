@@ -23,6 +23,10 @@ test("loadConfig creates defaults when file missing", () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test("default API bind exposes the portal on all interfaces", () => {
+  assert.equal(DEFAULT_CONFIG.apiBind, "0.0.0.0");
+});
+
 test("loadConfig merges partial config over defaults", () => {
   const dir = tmpDir();
   const configPath = path.join(dir, "config.json");

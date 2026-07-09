@@ -4,6 +4,15 @@
  * from here so the wording never drifts out of sync.
  */
 
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 export function guardJsonBody(port, apiBase) {
   return {
     ok: false,
@@ -26,6 +35,7 @@ export function guardJsonBody(port, apiBase) {
 }
 
 export function guardHtmlBody(port, apiBase) {
+  const safeApiBase = escapeHtml(apiBase);
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -44,16 +54,16 @@ export function guardHtmlBody(port, apiBase) {
 <h1>端口 ${port} 已被守卫 / Port ${port} is reserved</h1>
 <p class="warn">DO NOT kill the process on this port — it is local-portal infrastructure, not a stale dev server.</p>
 <p>This port is intentionally reserved by <strong>local-portal</strong>, the port registry for this machine. Register your app to get a dedicated port instead:</p>
-<pre><code>curl ${apiBase}/api/agent-guide</code></pre>
-<pre><code>curl ${apiBase}/api/ports</code></pre>
-<pre><code>curl -X POST ${apiBase}/api/register \\
+<pre><code>curl ${safeApiBase}/api/agent-guide</code></pre>
+<pre><code>curl ${safeApiBase}/api/ports</code></pre>
+<pre><code>curl -X POST ${safeApiBase}/api/register \\
   -H 'content-type: application/json' \\
   -d '{"name":"&lt;your-app-name&gt;","description":"&lt;what it is&gt;"}'</code></pre>
 <p>Use <code>granted.port</code> from the response as your server's listen port. When done:</p>
-<pre><code>curl -X POST ${apiBase}/api/release \\
+<pre><code>curl -X POST ${safeApiBase}/api/release \\
   -H 'content-type: application/json' \\
   -d '{"name":"&lt;your-app-name&gt;","port":&lt;granted&gt;}'</code></pre>
-<p><a href="${apiBase}/">Open the local-portal dashboard →</a></p>
+<p><a href="${safeApiBase}/">Open the local-portal dashboard →</a></p>
 </body>
 </html>
 `;

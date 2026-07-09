@@ -2,6 +2,18 @@ import http from "node:http";
 
 import { guardHtmlBody, guardJsonBody } from "./guide.js";
 
+function apiBaseForGuardRequest(req, { apiBase, publicApiBase, apiPort }) {
+  if (apiBase) return apiBase;
+  if (publicApiBase) return publicApiBase;
+
+  const hostHeader = typeof req.headers.host === "string" ? req.headers.host.trim() : "";
+  const hostWithoutPort = hostHeader.startsWith("[")
+    ? hostHeader.slice(0, hostHeader.indexOf("]") + 1)
+    : hostHeader.split(":")[0];
+  const host = hostWithoutPort && !/[\r\n]/.test(hostWithoutPort) ? hostWithoutPort : "127.0.0.1";
+  return `http://${host}:${apiPort}`;
+}
+
 function bindOne(handler, port, host, listenOptions) {
   return new Promise((resolve) => {
     const server = http.createServer(handler);
@@ -35,7 +47,7 @@ function bindOne(handler, port, host, listenOptions) {
  * bind can't slip past the guard on hosts where bindv6only=0. Any request to
  * a held port gets a 409 with registration guidance (guide.js).
  */
-export function createGuardManager({ ports, apiBase, log }) {
+export function createGuardManager({ ports, apiBase, publicApiBase, apiPort = 7777, log }) {
   const state = new Map(); // port -> { status: "held"|"wanted", servers: http.Server[] }
   for (const port of ports) {
     state.set(port, { status: "wanted", servers: [] });
@@ -44,19 +56,20 @@ export function createGuardManager({ ports, apiBase, log }) {
   function guardRequestHandler(req, res) {
     const port = req.socket.localPort;
     const wantsHtml = (req.headers.accept || "").includes("text/html");
+    const effectiveApiBase = apiBaseForGuardRequest(req, { apiBase, publicApiBase, apiPort });
 
     res.statusCode = 409;
     res.setHeader("X-Local-Portal", "guard");
-    res.setHeader("X-Local-Portal-Api", apiBase);
+    res.setHeader("X-Local-Portal-Api", effectiveApiBase);
     res.setHeader("Cache-Control", "no-store");
 
     const skipBody = req.method === "HEAD";
     if (wantsHtml) {
       res.setHeader("Content-Type", "text/html; charset=utf-8");
-      res.end(skipBody ? undefined : guardHtmlBody(port, apiBase));
+      res.end(skipBody ? undefined : guardHtmlBody(port, effectiveApiBase));
     } else {
       res.setHeader("Content-Type", "application/json; charset=utf-8");
-      res.end(skipBody ? undefined : JSON.stringify(guardJsonBody(port, apiBase)));
+      res.end(skipBody ? undefined : JSON.stringify(guardJsonBody(port, effectiveApiBase)));
     }
   }
 

@@ -51,6 +51,24 @@ test("guard returns HTML when Accept: text/html", async () => {
   }
 });
 
+test("guard HTML escapes config-derived API base", async () => {
+  const port = await getEphemeralPort();
+  const maliciousApiBase = 'portal-base"><script>alert(1)</script>';
+  const guard = createGuardManager({ ports: [port], apiBase: maliciousApiBase, log: undefined });
+  await guard.acquireAll();
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/`, { headers: { Accept: "text/html" } });
+    assert.equal(res.status, 409);
+    const text = await res.text();
+    assert.doesNotMatch(text, /<script>alert\(1\)<\/script>/);
+    assert.doesNotMatch(text, new RegExp(`href="${maliciousApiBase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/"`));
+    assert.match(text, /&quot;&gt;&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+  } finally {
+    guard.releaseAll();
+  }
+});
+
 test("guard reports 'wanted' when the port is already occupied, then acquires on retry after it frees", async () => {
   const port = await getEphemeralPort();
   const occupier = net.createServer();

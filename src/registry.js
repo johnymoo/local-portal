@@ -15,13 +15,20 @@ function genId() {
   return "reg_" + crypto.randomBytes(4).toString("hex");
 }
 
+function isValidTimestamp(value, { nullable = false } = {}) {
+  if (value === null && nullable) return true;
+  return typeof value === "string" && Number.isFinite(Date.parse(value));
+}
+
 function isValidRecord(rec) {
   if (!rec || typeof rec !== "object") return false;
   if (typeof rec.id !== "string") return false;
   if (!isValidName(rec.name)) return false;
   if (!Number.isInteger(rec.port) || rec.port < 1 || rec.port > 65535) return false;
   if (!["pending", "active", "stale"].includes(rec.status)) return false;
-  if (typeof rec.registeredAt !== "string") return false;
+  if (!isValidTimestamp(rec.registeredAt)) return false;
+  if (!isValidTimestamp(rec.lastSeenListeningAt, { nullable: true })) return false;
+  if (!isValidTimestamp(rec.staleSince, { nullable: true })) return false;
   return true;
 }
 

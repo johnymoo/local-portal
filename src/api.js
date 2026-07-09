@@ -108,6 +108,19 @@ function grantedView(record, pendingGraceSec) {
   };
 }
 
+function normalizeHostHeader(host) {
+  if (typeof host !== "string") return null;
+  const trimmed = host.trim();
+  if (trimmed.length === 0 || /[\r\n]/.test(trimmed)) return null;
+  return trimmed;
+}
+
+export function apiBaseFromRequest(req, config) {
+  if (config.publicApiBase) return config.publicApiBase;
+  const host = normalizeHostHeader(req.headers.host);
+  return `http://${host || `127.0.0.1:${config.apiPort}`}`;
+}
+
 function nextSteps(record, apiBase, pendingGraceSec) {
   const bindBy = new Date(Date.parse(record.registeredAt) + pendingGraceSec * 1000).toISOString();
   return [
@@ -339,13 +352,13 @@ async function handleRelease(req, res, ctx) {
  */
 export function createApiServer(deps) {
   const { config, registry, allocator, scanner, guards, dashboard, getLastScan, log } = deps;
-  const apiBase = config.publicApiBase || `http://127.0.0.1:${config.apiPort}`;
   const startedAt = new Date().toISOString();
 
   async function route(req, res) {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     const pathname = url.pathname;
     const method = req.method;
+    const apiBase = apiBaseFromRequest(req, config);
 
     if (pathname === "/" && method === "GET") {
       const view = buildPortsView({ registry, guards, getLastScan });

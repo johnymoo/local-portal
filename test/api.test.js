@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -19,6 +20,32 @@ async function getEphemeralPort() {
   return port;
 }
 
+function getJsonWithHost(apiBase, path, hostHeader) {
+  const url = new URL(apiBase);
+  return new Promise((resolve, reject) => {
+    const req = http.get(
+      {
+        hostname: url.hostname,
+        port: Number(url.port),
+        path,
+        headers: { Host: hostHeader },
+      },
+      (res) => {
+        const chunks = [];
+        res.on("data", (chunk) => chunks.push(chunk));
+        res.on("end", () => {
+          try {
+            resolve({ status: res.statusCode, body: JSON.parse(Buffer.concat(chunks).toString("utf8")) });
+          } catch (err) {
+            reject(err);
+          }
+        });
+      }
+    );
+    req.on("error", reject);
+  });
+}
+
 function tmpRegistryPath() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "local-portal-api-"));
   return path.join(dir, "registry.json");
@@ -31,7 +58,7 @@ async function setupServer(overrides = {}) {
   const config = {
     apiPort,
     apiBind: "127.0.0.1",
-    publicApiBase: null,
+    publicApiBase: overrides.publicApiBase ?? null,
     guardPorts: [guardPort],
     allocRange: { start: 20000, end: 20002 },
     pendingGraceSec: 300,
@@ -106,6 +133,33 @@ test("GET /api/health returns the service signature", async () => {
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.deepEqual(body, { ok: true, service: "local-portal", version: "1.0.0", pid: process.pid });
+  } finally {
+    await ctx.close();
+  }
+});
+
+test("GET /api/ports uses request Host for apiBase when publicApiBase is unset", async () => {
+  const ctx = await setupServer();
+  try {
+    const port = new URL(ctx.apiBase).port;
+    const { status, body } = await getJsonWithHost(ctx.apiBase, "/api/ports", `portal.lan:${port}`);
+    assert.equal(status, 200);
+    assert.equal(body.portal.apiBase, `http://portal.lan:${new URL(ctx.apiBase).port}`);
+  } finally {
+    await ctx.close();
+  }
+});
+
+test("GET /api/agent-guide honors explicit publicApiBase over request Host", async () => {
+  const ctx = await setupServer({ publicApiBase: "http://portal.example.test:7777" });
+  try {
+    const res = await fetch(`${ctx.apiBase}/api/agent-guide`, {
+      headers: { Host: `ignored.lan:${new URL(ctx.apiBase).port}` },
+    });
+    assert.equal(res.status, 200);
+    const text = await res.text();
+    assert.match(text, /local-portal`, a port registry at http:\/\/portal\.example\.test:7777/);
+    assert.doesNotMatch(text, /ignored\.lan/);
   } finally {
     await ctx.close();
   }

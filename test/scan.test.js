@@ -90,6 +90,42 @@ test("isPortFree returns false while a v4 listener holds the port", async () => 
   await new Promise((resolve) => server.close(resolve));
 });
 
+test("isPortFree treats failed bind probes as occupied even if close reports server not running", async () => {
+  const originalCreateServer = net.createServer;
+  let restored = false;
+
+  net.createServer = () => {
+    const listeners = new Map();
+    return {
+      once(event, handler) {
+        listeners.set(event, handler);
+        return this;
+      },
+      removeAllListeners() {},
+      close() {
+        throw Object.assign(new Error("Server is not running."), { code: "ERR_SERVER_NOT_RUNNING" });
+      },
+      listen() {
+        listeners.get("error")?.(Object.assign(new Error("address in use"), { code: "EADDRINUSE" }));
+      },
+    };
+  };
+
+  try {
+    const mod = await import(`../src/scan.js?close-failure=${Date.now()}`);
+    const result = await Promise.race([
+      mod.isPortFree(49152, { timeoutMs: 10 }),
+      new Promise((resolve) => setTimeout(() => resolve("timed-out"), 25)),
+    ]);
+    assert.equal(result, false);
+  } finally {
+    net.createServer = originalCreateServer;
+    restored = true;
+  }
+
+  assert.equal(restored, true);
+});
+
 test("isPortFree returns false while a v6-only listener holds the port", async () => {
   const server = net.createServer();
   await new Promise((resolve, reject) => {

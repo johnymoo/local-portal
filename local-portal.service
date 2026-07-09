@@ -4,9 +4,9 @@ After=network.target
 
 [Service]
 Type=simple
-# nvm-installed node is not on systemd's PATH - use the absolute path.
-# Find yours with `which node` and update this line accordingly.
-ExecStart=/home/chriswang/.nvm/versions/node/v22.23.0/bin/node %h/project/Shili/workspaces/dev-lite/local-portal/src/main.js
+# Update this path if you install local-portal somewhere else.
+WorkingDirectory=%h/project/Shili/workspaces/dev-lite/local-portal
+ExecStart=/usr/bin/env node src/main.js
 Restart=on-failure
 RestartSec=5
 # exit code 2 means another local-portal instance already owns this apiPort - don't fight it.

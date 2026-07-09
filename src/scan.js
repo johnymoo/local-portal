@@ -124,6 +124,7 @@ function bindTest(port, host, listenOptions, timeoutMs) {
   return new Promise((resolve) => {
     const server = net.createServer();
     let settled = false;
+    let listening = false;
     const timer = setTimeout(() => finish(false), timeoutMs);
 
     function finish(result) {
@@ -131,8 +132,11 @@ function bindTest(port, host, listenOptions, timeoutMs) {
       settled = true;
       clearTimeout(timer);
       server.removeAllListeners();
-      server.close();
-      resolve(result);
+      if (!listening) {
+        resolve(result);
+        return;
+      }
+      server.close(() => resolve(result));
     }
 
     server.once("error", (err) => {
@@ -145,7 +149,10 @@ function bindTest(port, host, listenOptions, timeoutMs) {
         finish(false);
       }
     });
-    server.once("listening", () => finish(true));
+    server.once("listening", () => {
+      listening = true;
+      finish(true);
+    });
 
     try {
       server.listen({ port, host, ...listenOptions });
