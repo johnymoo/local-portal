@@ -1,0 +1,9 @@
+LISTEN 0      5            0.0.0.0:52341 0.0.0.0:* users:(("python3",pid=3733488,fd=3))
+LISTEN 0      4096         0.0.0.0:18888 0.0.0.0:*
+LISTEN 0      4096   127.0.0.53%lo:53    0.0.0.0:*
+LISTEN 0      4096            [::]:55571    [::]:*
+LISTEN 0      10        *:3389     *:* users:(("gnome-remote-de",pid=2836,fd=8))
+LISTEN 0      511       *:3201     *:* users:(("next-server (v1",pid=1935026,fd=19))
+LISTEN 0      128        127.0.0.1:631   0.0.0.0:*
+LISTEN 0      511         0.0.0.0:3000  0.0.0.0:* users:(("node",pid=412345,fd=18))
+LISTEN 0      511            [::]:3000     [::]:* users:(("node",pid=412345,fd=19))
