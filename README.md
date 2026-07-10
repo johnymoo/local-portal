@@ -87,10 +87,11 @@ bin/portalctl guide                                     # 打印 agent-guide mar
 ## systemd 部署（用户级服务）
 
 ```bash
-mkdir -p ~/.config/systemd/user
-cp local-portal.service ~/.config/systemd/user/
-# 如果仓库不在模板里的默认路径，修改 WorkingDirectory。
-# 如果 systemd 找不到 node，给 ExecStart 配置你的 node 绝对路径。
+mkdir -p ~/.local/share/local-portal ~/.config/systemd/user
+cp -R src bin package.json README.md local-portal.service ~/.local/share/local-portal/
+cp ~/.local/share/local-portal/local-portal.service ~/.config/systemd/user/
+# 如果安装到其他目录，修改 local-portal.service 里的 WorkingDirectory。
+# 如果 systemd 找不到 Node >= 20，给 ExecStart 配置你的 node 绝对路径。
 systemctl --user daemon-reload
 systemctl --user enable --now local-portal
 journalctl --user -u local-portal -f

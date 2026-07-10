@@ -4,8 +4,8 @@ After=network.target
 
 [Service]
 Type=simple
-# Update this path if you install local-portal somewhere else.
-WorkingDirectory=%h/project/Shili/workspaces/dev-lite/local-portal
+# Default install location used by README.md. Update if you install elsewhere.
+WorkingDirectory=%h/.local/share/local-portal
 ExecStart=/usr/bin/env node src/main.js
 Restart=on-failure
 RestartSec=5
