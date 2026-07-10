@@ -33,8 +33,8 @@ npm start
 | 字段 | 默认值 | 说明 |
 |---|---|---|
 | `apiPort` | `7777` | API/仪表盘监听端口，启动后不会自动更换（Agent 需要稳定地址） |
-| `apiBind` | `127.0.0.1` | API 监听地址，见下方安全说明 |
-| `publicApiBase` | `null` | 若设置，guard/guide 中的引导 URL 使用此值而非 `127.0.0.1` |
+| `apiBind` | `0.0.0.0` | API 监听地址，默认允许局域网访问，见下方安全说明 |
+| `publicApiBase` | `null` | 若设置，guard/guide 中的引导 URL 固定使用此值；未设置时 API 响应使用请求的 `Host` |
 | `guardPorts` | `[3000,3001,4200,5000,5173,8000,8080,8888]` | 需要守卫的端口列表 |
 | `allocRange` | `{start:20000,end:20999}` | 自动分配端口的区间 |
 | `scanIntervalSec` | `30` | OS 端口扫描 / 状态调和的周期 |
@@ -68,7 +68,8 @@ curl -s http://127.0.0.1:7777/api/agent-guide >> ~/.claude/CLAUDE.md
 # 或写入项目里的 AGENTS.md / CLAUDE.md
 ```
 
-仪表盘（`http://127.0.0.1:7777/`）里也有一个可展开的「Agent 接入指南」区块，带一键复制。
+仪表盘（本机 `http://127.0.0.1:7777/`，局域网用 `http://<host-or-ip>:7777/`）里也有一个
+可展开的「Agent 接入指南」区块，带一键复制。
 
 ## `portalctl` CLI
 
@@ -86,10 +87,11 @@ bin/portalctl guide                                     # 打印 agent-guide mar
 ## systemd 部署（用户级服务）
 
 ```bash
-mkdir -p ~/.config/systemd/user
-cp local-portal.service ~/.config/systemd/user/
-# 检查/修改 ExecStart 里的 node 绝对路径（nvm 安装的 node 不在 systemd 的 PATH 里）：
-which node
+mkdir -p ~/.local/share/local-portal ~/.config/systemd/user
+cp -R src bin package.json README.md local-portal.service ~/.local/share/local-portal/
+cp ~/.local/share/local-portal/local-portal.service ~/.config/systemd/user/
+# 如果安装到其他目录，修改 local-portal.service 里的 WorkingDirectory。
+# 如果 systemd 找不到 Node >= 20，给 ExecStart 配置你的 node 绝对路径。
 systemctl --user daemon-reload
 systemctl --user enable --now local-portal
 journalctl --user -u local-portal -f
@@ -108,10 +110,12 @@ loginctl enable-linger "$USER"
 
 ## 安全说明
 
-- API 默认只监听 `127.0.0.1`：它是可写接口（注册/释放）且没有鉴权，只信任本机调用方。
-- 如果确实需要让局域网内其他机器访问（比如仪表盘），把 `apiBind` 改成 `0.0.0.0`，并设置
-  `publicApiBase` 为局域网可达的地址，同时确保网络本身可信——任何能连到这个端口的人都能
-  注册/释放端口。
+- API 默认监听 `0.0.0.0`，方便局域网内其他机器访问仪表盘和注册接口。
+- API 是可写接口（注册/释放）且没有鉴权。只在可信局域网或受防火墙保护的主机上这样运行；
+  任何能连到这个端口的人都能注册/释放端口。
+- 如果需要让 guard/guide 永远显示固定地址（例如 DNS 名称或反向代理地址），设置
+  `publicApiBase` 为局域网可达的地址。
+- 如果只允许本机访问，把 `apiBind` 改回 `127.0.0.1`。
 - 守卫端口永远监听通配地址（`0.0.0.0` + `[::]`），这是守卫机制本身要求的，不可配置。
 
 ## 局限性

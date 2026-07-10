@@ -1,0 +1,163 @@
+#!/usr/bin/env node
+// Minimal CLI for local-portal. No dependencies - just fetch.
+
+const PORTAL_URL = process.env.PORTAL_URL || "http://127.0.0.1:7777";
+
+function printUsage() {
+  console.log(`Usage: portalctl <command> [args]
+
+Commands:
+  status                                     show all tracked ports
+  check <port>                               show the state of one port
+  register <name> [--port N] [--desc "..."]  register a port
+  release <name> <port> [--force]            release a registration
+  guide                                      print the agent guide markdown
+
+Env:
+  PORTAL_URL   local-portal API base (default http://127.0.0.1:7777)`);
+}
+
+function fail(message) {
+  console.error(`error: ${message}`);
+  process.exitCode = 1;
+}
+
+async function fetchJson(path, opts) {
+  let res;
+  try {
+    res = await fetch(`${PORTAL_URL}${path}`, opts);
+  } catch (err) {
+    throw new Error(`cannot reach local-portal at ${PORTAL_URL} (${err.message})`);
+  }
+  let body = null;
+  try {
+    body = await res.json();
+  } catch {
+    /* no JSON body */
+  }
+  return { status: res.status, body };
+}
+
+function printTable(header, rows) {
+  const widths = header.map((h, i) => Math.max(h.length, ...rows.map((r) => (r[i] || "").length)));
+  const line = (cols) => cols.map((c, i) => (c || "").padEnd(widths[i])).join("  ");
+  console.log(line(header));
+  console.log(widths.map((w) => "-".repeat(w)).join("  "));
+  for (const r of rows) console.log(line(r));
+}
+
+function parseFlags(args) {
+  const positional = [];
+  const flags = {};
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a.startsWith("--")) {
+      const key = a.slice(2);
+      const next = args[i + 1];
+      if (next !== undefined && !next.startsWith("--")) {
+        flags[key] = next;
+        i++;
+      } else {
+        flags[key] = true;
+      }
+    } else {
+      positional.push(a);
+    }
+  }
+  return { positional, flags };
+}
+
+async function cmdStatus() {
+  const { status, body } = await fetchJson("/api/ports");
+  if (status !== 200 || !body?.ok) return fail(body?.error?.message || `unexpected status ${status}`);
+
+  console.log(
+    `local-portal ${body.portal.version} @ ${body.portal.apiBase} (scan: ${body.portal.scanSource}, ${body.portal.lastScanAt})`
+  );
+  console.log(`alloc range ${body.allocRange.start}-${body.allocRange.end}: ${body.allocRange.used} used\n`);
+
+  const rows = body.ports.map((p) => [
+    String(p.port),
+    p.state,
+    p.registration ? p.registration.name : p.process ? `${p.process.name}(${p.process.pid})` : "",
+  ]);
+  printTable(["PORT", "STATE", "OWNER"], rows);
+}
+
+async function cmdCheck(portArg) {
+  if (!portArg) return fail("usage: portalctl check <port>");
+  const { status, body } = await fetchJson(`/api/ports/${portArg}`);
+  if (status !== 200) return fail(body?.error?.message || `unexpected status ${status}`);
+  console.log(JSON.stringify(body, null, 2));
+}
+
+async function cmdRegister(args) {
+  const { positional, flags } = parseFlags(args);
+  const name = positional[0];
+  if (!name) return fail('usage: portalctl register <name> [--port N] [--desc "..."]');
+
+  const payload = { name };
+  if (flags.desc) payload.description = String(flags.desc);
+  if (flags.port) payload.preferredPort = Number(flags.port);
+
+  const { status, body } = await fetchJson("/api/register", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (status !== 200 && status !== 201) return fail(body?.error?.message || `unexpected status ${status}`);
+
+  console.log(`granted port ${body.granted.port} (status: ${body.granted.status}${body.existing ? ", existing" : ""})`);
+  for (const step of body.next_steps) console.log(`  - ${step}`);
+}
+
+async function cmdRelease(args) {
+  const { positional, flags } = parseFlags(args);
+  const [name, portArg] = positional;
+  if (!name || !portArg) return fail("usage: portalctl release <name> <port> [--force]");
+
+  const payload = { name, port: Number(portArg) };
+  if (flags.force) payload.force = true;
+
+  const { status, body } = await fetchJson("/api/release", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (status !== 200) return fail(body?.error?.message || `unexpected status ${status}`);
+
+  console.log(`released ${body.released.name}:${body.released.port}`);
+}
+
+async function cmdGuide() {
+  const res = await fetch(`${PORTAL_URL}/api/agent-guide`);
+  console.log(await res.text());
+}
+
+async function main() {
+  const [, , cmd, ...rest] = process.argv;
+
+  if (!cmd || cmd === "--help" || cmd === "-h") {
+    printUsage();
+    process.exitCode = cmd ? 0 : 1;
+    return;
+  }
+
+  switch (cmd) {
+    case "status":
+      return cmdStatus();
+    case "check":
+      return cmdCheck(rest[0]);
+    case "register":
+      return cmdRegister(rest);
+    case "release":
+      return cmdRelease(rest);
+    case "guide":
+      return cmdGuide();
+    default:
+      printUsage();
+      process.exitCode = 1;
+  }
+}
+
+main().catch((err) => fail(err.message || String(err)));

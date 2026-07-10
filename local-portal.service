@@ -1,0 +1,17 @@
+[Unit]
+Description=local-portal - dev port guard and registry
+After=network.target
+
+[Service]
+Type=simple
+# Default install location used by README.md. Update if you install elsewhere.
+WorkingDirectory=%h/.local/share/local-portal
+ExecStart=/usr/bin/env node src/main.js
+Restart=on-failure
+RestartSec=5
+# exit code 2 means another local-portal instance already owns this apiPort - don't fight it.
+RestartPreventExitStatus=2
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=default.target

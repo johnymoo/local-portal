@@ -1,0 +1,17 @@
+{
+  "name": "local-portal",
+  "version": "1.0.0",
+  "description": "本机开发端口守卫与注册中心",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "portalctl": "./bin/portalctl"
+  },
+  "scripts": {
+    "start": "node src/main.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
