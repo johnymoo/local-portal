@@ -273,6 +273,92 @@ function largeRegistrySnapshot(payloadBytes = 49 * 1024 * 1024) {
   })}\n`;
 }
 
+function registrySnapshot(name = "legacy-owner") {
+  return `${JSON.stringify({
+    schemaVersion: 1,
+    updatedAt: new Date(1_000_000).toISOString(),
+    registrations: [
+      {
+        id: `reg_${name}`,
+        name,
+        description: "",
+        port: 20000,
+        requestedPort: null,
+        status: "active",
+        registeredAt: new Date(1_000_000).toISOString(),
+        lastSeenListeningAt: new Date(1_000_000).toISOString(),
+        staleSince: null,
+        observedProcess: null,
+        meta: {},
+      },
+    ],
+  })}\n`;
+}
+
+function failSecondModeMigration(filePath, stage) {
+  const fdPaths = new Map();
+  let attempts = 0;
+  let failRevalidation = false;
+  const injected = () => {
+    const error = new Error(`injected registry migration ${stage} failure`);
+    error.code = "EIO";
+    throw error;
+  };
+  return new Proxy(fs, {
+    get(target, property) {
+      if (property === "openSync") {
+        return (targetPath, flags, mode) => {
+          const fd = target.openSync(targetPath, flags, mode);
+          fdPaths.set(fd, targetPath);
+          return fd;
+        };
+      }
+      if (property === "closeSync") {
+        return (fd) => {
+          fdPaths.delete(fd);
+          return target.closeSync(fd);
+        };
+      }
+      if (property === "fchmodSync") {
+        return (fd, mode) => {
+          if (fdPaths.get(fd) === filePath) {
+            attempts += 1;
+            if (attempts === 2 && stage === "fchmod") injected();
+          }
+          return target.fchmodSync(fd, mode);
+        };
+      }
+      if (property === "fsyncSync") {
+        return (fd) => {
+          if (attempts === 2 && fdPaths.get(fd) === filePath) {
+            if (stage === "fsync") injected();
+            if (stage === "revalidation") failRevalidation = true;
+          }
+          if (
+            attempts === 2 &&
+            stage === "parent-fsync" &&
+            fdPaths.get(fd) === path.dirname(filePath)
+          ) {
+            injected();
+          }
+          return target.fsyncSync(fd);
+        };
+      }
+      if (property === "lstatSync") {
+        return (targetPath) => {
+          if (targetPath === filePath && failRevalidation) {
+            failRevalidation = false;
+            injected();
+          }
+          return target.lstatSync(targetPath);
+        };
+      }
+      const value = Reflect.get(target, property);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
 function rollbackRecord(content, targetExisted = true) {
   return `${JSON.stringify({
     recoveryVersion: 1,
@@ -322,6 +408,115 @@ test("persist + load round trip preserves records, tmp file cleaned up", () => {
   const registry2 = createRegistry({ filePath, now: c.now });
   registry2.load();
   assert.equal(registry2.getByPort(20000).name, "my-app");
+});
+
+test("current-owner 0664 registry is secured before register and release", () => {
+  const filePath = tmpFile();
+  fs.writeFileSync(filePath, registrySnapshot(), { mode: 0o600 });
+  fs.chmodSync(filePath, 0o664);
+
+  const registry = createRegistry({ filePath, now: () => 2_000_000 });
+  registry.load();
+  assert.equal(fs.statSync(filePath).mode & 0o777, 0o600);
+  registry.register({ name: "new-owner", port: 20001 });
+
+  const afterRegister = createRegistry({ filePath, now: () => 3_000_000 });
+  afterRegister.load();
+  assert.equal(afterRegister.getByPort(20000)?.name, "legacy-owner");
+  assert.equal(afterRegister.getByPort(20001)?.name, "new-owner");
+  afterRegister.release(20000);
+
+  const afterRelease = createRegistry({ filePath, now: () => 4_000_000 });
+  afterRelease.load();
+  assert.equal(afterRelease.getByPort(20000), null);
+  assert.equal(afterRelease.getByPort(20001)?.name, "new-owner");
+  assert.equal(fs.statSync(filePath).mode & 0o777, 0o600);
+});
+
+for (const stage of ["fchmod", "fsync", "parent-fsync", "revalidation"]) {
+  test(`registry mode migration ${stage} failure cannot acknowledge a mutation`, () => {
+    const filePath = tmpFile();
+    fs.writeFileSync(filePath, registrySnapshot(), { mode: 0o600 });
+    fs.chmodSync(filePath, 0o664);
+    const registry = createRegistry({ filePath, fsImpl: failSecondModeMigration(filePath, stage) });
+    registry.load();
+    fs.chmodSync(filePath, 0o664);
+
+    assert.throws(
+      () => registry.release(20000),
+      (error) =>
+        error.code === "registry_persist_failed" &&
+        error.message.includes(`injected registry migration ${stage} failure`),
+    );
+    assert.equal(registry.getByPort(20000)?.name, "legacy-owner");
+    assertOnlyRegistryFileRemains(filePath);
+
+    const restarted = createRegistry({ filePath });
+    restarted.load();
+    assert.equal(restarted.getByPort(20000)?.name, "legacy-owner");
+    assert.equal(fs.statSync(filePath).mode & 0o777, 0o600);
+  });
+}
+
+for (const scenario of ["symlink", "directory", "wrong-owner"]) {
+  test(`unsafe main registry ${scenario} is rejected without being followed or changed`, () => {
+    const filePath = tmpFile();
+    let fsImpl = fs;
+    let target;
+    if (scenario === "symlink") {
+      target = `${filePath}.target`;
+      fs.writeFileSync(target, registrySnapshot(), { mode: 0o600 });
+      fs.chmodSync(target, 0o664);
+      fs.symlinkSync(target, filePath);
+    } else if (scenario === "directory") {
+      fs.mkdirSync(filePath, { mode: 0o700 });
+    } else {
+      fs.writeFileSync(filePath, registrySnapshot(), { mode: 0o600 });
+      fsImpl = new Proxy(fs, {
+        get(targetFs, property) {
+          if (property === "lstatSync" || property === "fstatSync") {
+            return (...args) => {
+              const stat = targetFs[property](...args);
+              return new Proxy(stat, {
+                get(statTarget, statProperty) {
+                  if (statProperty === "uid") return statTarget.uid + 1;
+                  const value = Reflect.get(statTarget, statProperty);
+                  return typeof value === "function" ? value.bind(statTarget) : value;
+                },
+              });
+            };
+          }
+          const value = Reflect.get(targetFs, property);
+          return typeof value === "function" ? value.bind(targetFs) : value;
+        },
+      });
+    }
+
+    const registry = createRegistry({ filePath, fsImpl });
+    assert.throws(() => registry.load(), (error) => error.code === "registry_persist_failed");
+    assert.equal(registry.all().length, 0);
+    if (target) assert.equal(fs.statSync(target).mode & 0o777, 0o664);
+  });
+}
+
+test("FIFO main registry is rejected without blocking", () => {
+  const filePath = tmpFile();
+  execFileSync("mkfifo", [filePath]);
+  const registryUrl = new URL("../src/registry.js", import.meta.url).href;
+  const script = `
+    import { createRegistry } from ${JSON.stringify(registryUrl)};
+    try {
+      createRegistry({ filePath: ${JSON.stringify(filePath)} }).load();
+      process.exit(2);
+    } catch (error) {
+      process.exit(error.code === "registry_persist_failed" ? 0 : 3);
+    }
+  `;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+    timeout: 1_000,
+  });
+  assert.equal(child.signal, null, child.stderr?.toString());
+  assert.equal(child.status, 0, child.stderr?.toString());
 });
 
 test("oversized legacy snapshot is rejected before creating unreadable rollback evidence", () => {

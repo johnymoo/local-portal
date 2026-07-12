@@ -26,6 +26,11 @@ npm start
 首次运行会在 `~/.config/local-portal/config.json` 自动创建默认配置。注册数据持久化在
 `~/.local/state/local-portal/registry.json`。
 
+启动加载和首次 mutation 都会先对主 registry 做 descriptor-bound preflight：拒绝 symlink、
+目录、FIFO、非当前用户文件和超限文件。旧部署留下的 current-owner regular registry（例如
+x570 上的 `0664` 文件）会在同一个已验证 fd 上自动收紧为 `0600`，并完成文件 metadata 与
+父目录 `fsync`、inode/path/mode 复核后才继续。迁移任一步失败都会 fail closed，不会确认 mutation。
+
 停止服务：`Ctrl+C` 或 `kill -TERM <pid>` —— 会优雅释放所有守卫端口并写盘。
 
 ## 配置项（`~/.config/local-portal/config.json`）

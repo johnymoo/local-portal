@@ -98,12 +98,19 @@ export function createRegistry({ filePath, log, now = () => Date.now(), fsImpl =
     return new RegistryPersistenceError(message, { cause });
   }
 
-  function validateRecoveryStat(stat, label, maxBytes = MAX_RECOVERY_RECORD_BYTES) {
+  function validateRecoveryStat(
+    stat,
+    label,
+    maxBytes = MAX_RECOVERY_RECORD_BYTES,
+    { requireMode = true } = {},
+  ) {
     if (!stat.isFile()) throw recoveryError(`${label} must be a regular file`);
     if (typeof process.getuid !== "function" || stat.uid !== process.getuid()) {
       throw recoveryError(`${label} must be owned by the current user`);
     }
-    if ((stat.mode & 0o777) !== 0o600) throw recoveryError(`${label} mode must be 0600`);
+    if (requireMode && (stat.mode & 0o777) !== 0o600) {
+      throw recoveryError(`${label} mode must be 0600`);
+    }
     if (stat.size > maxBytes) throw recoveryError(`${label} exceeds the size limit`);
   }
 
@@ -119,11 +126,11 @@ export function createRegistry({ filePath, log, now = () => Date.now(), fsImpl =
   function readRecoveryFile(
     targetPath,
     label,
-    { maxBytes = MAX_RECOVERY_RECORD_BYTES } = {},
+    { maxBytes = MAX_RECOVERY_RECORD_BYTES, migrateMode = false } = {},
   ) {
     const pathStat = lstatIfPresent(targetPath);
     if (!pathStat) return null;
-    validateRecoveryStat(pathStat, label, maxBytes);
+    validateRecoveryStat(pathStat, label, maxBytes, { requireMode: !migrateMode });
 
     let fd;
     let primaryError;
@@ -134,9 +141,9 @@ export function createRegistry({ filePath, log, now = () => Date.now(), fsImpl =
         (fsImpl.constants.O_NONBLOCK ?? 0);
       fd = fsImpl.openSync(targetPath, flags);
       const descriptorStat = fsImpl.fstatSync(fd);
-      validateRecoveryStat(descriptorStat, label, maxBytes);
+      validateRecoveryStat(descriptorStat, label, maxBytes, { requireMode: !migrateMode });
       const currentPathStat = fsImpl.lstatSync(targetPath);
-      validateRecoveryStat(currentPathStat, label, maxBytes);
+      validateRecoveryStat(currentPathStat, label, maxBytes, { requireMode: !migrateMode });
       if (
         descriptorStat.dev !== pathStat.dev ||
         descriptorStat.ino !== pathStat.ino ||
@@ -146,6 +153,32 @@ export function createRegistry({ filePath, log, now = () => Date.now(), fsImpl =
         currentPathStat.size !== descriptorStat.size
       ) {
         throw recoveryError(`${label} changed while it was being opened`);
+      }
+
+      if (
+        migrateMode &&
+        ((pathStat.mode & 0o777) !== 0o600 ||
+          (descriptorStat.mode & 0o777) !== 0o600 ||
+          (currentPathStat.mode & 0o777) !== 0o600)
+      ) {
+        fsImpl.fchmodSync(fd, 0o600);
+        fsImpl.fsyncSync(fd);
+        fsyncDirectory();
+
+        const migratedDescriptorStat = fsImpl.fstatSync(fd);
+        const migratedPathStat = fsImpl.lstatSync(targetPath);
+        validateRecoveryStat(migratedDescriptorStat, label, maxBytes);
+        validateRecoveryStat(migratedPathStat, label, maxBytes);
+        if (
+          migratedDescriptorStat.dev !== descriptorStat.dev ||
+          migratedDescriptorStat.ino !== descriptorStat.ino ||
+          migratedDescriptorStat.size !== descriptorStat.size ||
+          migratedPathStat.dev !== descriptorStat.dev ||
+          migratedPathStat.ino !== descriptorStat.ino ||
+          migratedPathStat.size !== descriptorStat.size
+        ) {
+          throw recoveryError(`${label} changed while its mode was being secured`);
+        }
       }
 
       const contents = Buffer.alloc(descriptorStat.size);
@@ -379,6 +412,7 @@ export function createRegistry({ filePath, log, now = () => Date.now(), fsImpl =
       const commit = decodeCommit(commitFile.text);
       const snapshotFile = readRecoveryFile(filePath, "committed registry snapshot", {
         maxBytes: MAX_REGISTRY_BYTES,
+        migrateMode: true,
       });
       if (!snapshotFile) throw recoveryError("committed registry snapshot is missing");
       const digest = crypto.createHash("sha256").update(snapshotFile.text).digest("hex");
@@ -417,7 +451,9 @@ export function createRegistry({ filePath, log, now = () => Date.now(), fsImpl =
     try {
       fsImpl.mkdirSync(directory, { recursive: true, mode: 0o700 });
       recoverInterruptedTransaction();
-      const previousFile = readRecoveryFile(filePath, "existing registry snapshot");
+      const previousFile = readRecoveryFile(filePath, "existing registry snapshot", {
+        migrateMode: true,
+      });
       previous = previousFile
         ? { exists: true, content: previousFile.text }
         : { exists: false, content: "" };
@@ -488,12 +524,13 @@ export function createRegistry({ filePath, log, now = () => Date.now(), fsImpl =
 
   function load() {
     recoverInterruptedTransaction();
-    if (!fsImpl.existsSync(filePath)) {
+    const snapshotFile = readRecoveryFile(filePath, "registry snapshot", { migrateMode: true });
+    if (!snapshotFile) {
       byPort = new Map();
       return { loaded: 0, quarantined: false };
     }
 
-    const text = fsImpl.readFileSync(filePath, "utf8");
+    const text = snapshotFile.text;
     let data;
     try {
       data = JSON.parse(text);

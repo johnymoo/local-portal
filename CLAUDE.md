@@ -59,8 +59,11 @@ signal handlers — every other module is pure logic wired together by main. The
   that advances state, called once per reconcile tick from `main.js`. Register/release persistence
   is copy-on-write and fail-closed: a same-directory rollback record, file fsync, atomic rename,
   and parent-directory fsync complete before memory is published or the API returns 2xx. Startup
-  resolves an interrupted transaction from the rollback record. A corrupt/unversioned registry
-  file gets quarantined to `registry.json.corrupt-<epoch>` rather than crashing startup.
+  resolves an interrupted transaction from the rollback record. Main-registry preflight is
+  descriptor-bound and automatically secures current-owner legacy regular files (such as mode
+  `0664`) to `0600` with file/directory fsync and inode/path revalidation; unsafe file types and
+  foreign owners fail closed. A corrupt/unversioned registry file gets quarantined to
+  `registry.json.corrupt-<epoch>` rather than crashing startup.
 - **`guard.js`** — owns the actual guard listeners. Each guarded port is a *pair* of
   `http.createServer()` instances (`0.0.0.0` + `[::]` with `ipv6Only: true`) — binding only IPv4
   is not enough to guard the port on a host with `net.ipv6.bindv6only=0`, since a v6-only bind can
