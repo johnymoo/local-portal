@@ -97,6 +97,24 @@ test("preferredPort: registered to another but stale is retained until durable r
   assert.equal(registry.getByPort(20000)?.name, "old-app");
 });
 
+test("preferredPort: stale owner identity is revalidated after the async port probe", async () => {
+  const stale = { id: "reg_old", port: 20000, name: "old-app", status: "stale" };
+  const registry = makeFakeRegistry([stale]);
+  const scanner = {
+    isPortFree: async () => {
+      registry._set({ ...stale, status: "pending" });
+      return true;
+    },
+  };
+  const allocator = createAllocator(baseCtx({ registry, scanner }));
+
+  await assert.rejects(
+    allocator.grant({ name: "new-app", preferredPort: 20000 }),
+    (error) => error.code === "allocation_changed" && error.owner === "old-app",
+  );
+  assert.equal(registry.getByPort(20000)?.status, "pending");
+});
+
 test("preferredPort: same name owning the port is not treated as a conflict", async () => {
   const registry = makeFakeRegistry([{ port: 20000, name: "my-app", status: "active" }]);
   const allocator = createAllocator(baseCtx({ registry }));

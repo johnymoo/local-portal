@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -122,6 +124,105 @@ function failCommitFsyncAndImmediateRollback(filePath) {
   });
 }
 
+function failAfterRollbackRemoval(filePath, restoreFailure) {
+  const fdPaths = new Map();
+  let rollbackRemoved = false;
+  let primaryFailed = false;
+  let restoreRenamed = false;
+  const injected = (message) => {
+    const error = new Error(message);
+    error.code = "EIO";
+    return error;
+  };
+  return new Proxy(fs, {
+    get(target, property) {
+      if (property === "openSync") {
+        return (targetPath, flags, mode) => {
+          const fd = target.openSync(targetPath, flags, mode);
+          fdPaths.set(fd, targetPath);
+          return fd;
+        };
+      }
+      if (property === "closeSync") {
+        return (fd) => {
+          fdPaths.delete(fd);
+          return target.closeSync(fd);
+        };
+      }
+      if (property === "unlinkSync") {
+        return (targetPath) => {
+          const result = target.unlinkSync(targetPath);
+          if (targetPath === `${filePath}.rollback`) rollbackRemoved = true;
+          return result;
+        };
+      }
+      if (property === "renameSync") {
+        return (source, destination) => {
+          if (primaryFailed && restoreFailure === "rename" && source === `${filePath}.restore`) {
+            throw injected("injected restore rename failure");
+          }
+          const result = target.renameSync(source, destination);
+          if (source === `${filePath}.restore` && destination === filePath) restoreRenamed = true;
+          return result;
+        };
+      }
+      if (property === "fsyncSync") {
+        return (fd) => {
+          const targetPath = fdPaths.get(fd);
+          if (!primaryFailed && rollbackRemoved && targetPath === path.dirname(filePath)) {
+            primaryFailed = true;
+            throw injected("injected post-unlink parent fsync failure");
+          }
+          if (primaryFailed && restoreFailure === "fsync" && restoreRenamed && targetPath === path.dirname(filePath)) {
+            throw injected("injected restore parent fsync failure");
+          }
+          return target.fsyncSync(fd);
+        };
+      }
+      const value = Reflect.get(target, property);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+function failRollbackRemovalOnce(filePath) {
+  let failed = false;
+  return new Proxy(fs, {
+    get(target, property) {
+      if (property === "unlinkSync") {
+        return (targetPath) => {
+          if (!failed && targetPath === `${filePath}.rollback`) {
+            failed = true;
+            const error = new Error("injected rollback removal failure");
+            error.code = "EIO";
+            throw error;
+          }
+          return target.unlinkSync(targetPath);
+        };
+      }
+      const value = Reflect.get(target, property);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+function rollbackRecord(content, targetExisted = true) {
+  return `${JSON.stringify({
+    recoveryVersion: 1,
+    targetExisted,
+    contentBase64: Buffer.from(content, "utf8").toString("base64"),
+    sha256: crypto.createHash("sha256").update(content).digest("hex"),
+  })}\n`;
+}
+
+function seedRollbackFixture() {
+  const filePath = tmpFile();
+  const seed = createRegistry({ filePath, now: () => 1_000_000 });
+  seed.register({ name: "old-owner", port: 20000 });
+  const content = fs.readFileSync(filePath, "utf8");
+  return { filePath, content, rollbackPath: `${filePath}.rollback` };
+}
+
 function assertOnlyRegistryFileRemains(filePath) {
   assert.deepEqual(fs.readdirSync(path.dirname(filePath)).sort(), [path.basename(filePath)]);
 }
@@ -197,15 +298,61 @@ test("successful register and release acknowledgements match fresh restart state
 
   const registered = registry.register({ name: "durable-app", port: 20000 });
   assert.equal(fs.statSync(filePath).mode & 0o777, 0o600);
+  assert.equal(fs.statSync(`${filePath}.commit`).mode & 0o777, 0o600);
   const afterRegister = createRegistry({ filePath, now: () => 2_000_000 });
   afterRegister.load();
   assert.equal(afterRegister.getByPort(20000)?.id, registered.id);
+  assert.equal(fs.existsSync(`${filePath}.commit`), false);
 
   registry.release(20000);
+  assert.equal(fs.existsSync(`${filePath}.commit`), true);
   const afterRelease = createRegistry({ filePath, now: () => 3_000_000 });
   afterRelease.load();
   assert.equal(afterRelease.getByPort(20000), null);
   assertOnlyRegistryFileRemains(filePath);
+});
+
+test("commit-only recovery rejects a main snapshot replaced before marker cleanup", () => {
+  const filePath = tmpFile();
+  const seed = createRegistry({ filePath, now: () => 1_000_000 });
+  seed.register({ name: "committed-owner", port: 20000 });
+  assert.equal(fs.existsSync(`${filePath}.commit`), true);
+
+  const replacementPath = `${filePath}.replacement`;
+  fs.writeFileSync(
+    replacementPath,
+    `${JSON.stringify({
+      schemaVersion: 1,
+      updatedAt: new Date(2_000_000).toISOString(),
+      registrations: [],
+    })}\n`,
+    { mode: 0o600 },
+  );
+
+  let mainPathChecks = 0;
+  const fsImpl = new Proxy(fs, {
+    get(target, property) {
+      if (property === "lstatSync") {
+        return (targetPath) => {
+          if (targetPath === filePath) {
+            mainPathChecks += 1;
+            if (mainPathChecks === 4) target.renameSync(replacementPath, filePath);
+          }
+          return target.lstatSync(targetPath);
+        };
+      }
+      const value = Reflect.get(target, property);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+
+  const registry = createRegistry({ filePath, fsImpl });
+  assert.throws(
+    () => registry.load(),
+    (error) => error.code === "registry_persist_failed" && /changed after it was read/.test(error.message),
+  );
+  assert.equal(registry.all().length, 0);
+  assert.equal(fs.existsSync(`${filePath}.commit`), true);
 });
 
 test("load completes a pending rollback after commit and immediate recovery both fail", () => {
@@ -232,6 +379,152 @@ test("load completes a pending rollback after commit and immediate recovery both
   assert.equal(restarted.getByPort(20000)?.name, "old-owner");
   assert.equal(restarted.getByPort(20001), null);
   assertOnlyRegistryFileRemains(filePath);
+});
+
+test("rollback removal failure keeps the old snapshot recoverable", () => {
+  const filePath = tmpFile();
+  const seed = createRegistry({ filePath, now: () => 1_000_000 });
+  seed.register({ name: "old-owner", port: 20000 });
+
+  const registry = createRegistry({
+    filePath,
+    now: () => 2_000_000,
+    fsImpl: failRollbackRemovalOnce(filePath),
+  });
+  registry.load();
+  assert.throws(
+    () => registry.register({ name: "new-owner", port: 20001 }),
+    (error) => error.code === "registry_persist_failed" && error.recoveryPending === true,
+  );
+  assert.equal(registry.getByPort(20000)?.name, "old-owner");
+  assert.equal(registry.getByPort(20001), null);
+  assert.equal(fs.existsSync(`${filePath}.rollback`), true);
+
+  const restarted = createRegistry({ filePath, now: () => 3_000_000 });
+  restarted.load();
+  assert.equal(restarted.getByPort(20000)?.name, "old-owner");
+  assert.equal(restarted.getByPort(20001), null);
+  assertOnlyRegistryFileRemains(filePath);
+});
+
+for (const restoreFailure of ["rename", "fsync"]) {
+  test(`post-unlink failure with immediate restore ${restoreFailure} failure keeps old-state evidence`, () => {
+    const filePath = tmpFile();
+    const seed = createRegistry({ filePath, now: () => 1_000_000 });
+    seed.register({ name: "old-owner", port: 20000 });
+
+    const registry = createRegistry({
+      filePath,
+      now: () => 2_000_000,
+      fsImpl: failAfterRollbackRemoval(filePath, restoreFailure),
+    });
+    registry.load();
+    assert.throws(
+      () => registry.register({ name: "new-owner", port: 20001 }),
+      (error) => error.code === "registry_persist_failed" && error.recoveryPending === true,
+    );
+    assert.equal(registry.getByPort(20000)?.name, "old-owner");
+    assert.equal(fs.existsSync(`${filePath}.rollback`), true);
+    assert.equal(fs.statSync(`${filePath}.rollback`).mode & 0o777, 0o600);
+
+    const restarted = createRegistry({ filePath, now: () => 3_000_000 });
+    restarted.load();
+    assert.equal(restarted.getByPort(20000)?.name, "old-owner");
+    assert.equal(restarted.getByPort(20001), null);
+    assertOnlyRegistryFileRemains(filePath);
+  });
+}
+
+for (const scenario of ["symlink", "directory", "wrong-mode", "wrong-owner", "oversize", "corrupt"]) {
+  test(`recovery record ${scenario} is rejected without changing registry state`, () => {
+    const { filePath, content, rollbackPath } = seedRollbackFixture();
+    let fsImpl = fs;
+    if (scenario === "symlink") {
+      const target = `${rollbackPath}.target`;
+      fs.writeFileSync(target, rollbackRecord(content), { mode: 0o600 });
+      fs.symlinkSync(target, rollbackPath);
+    } else if (scenario === "directory") {
+      fs.mkdirSync(rollbackPath, { mode: 0o700 });
+    } else if (scenario === "wrong-mode") {
+      fs.writeFileSync(rollbackPath, rollbackRecord(content), { mode: 0o644 });
+    } else if (scenario === "wrong-owner") {
+      fs.writeFileSync(rollbackPath, rollbackRecord(content), { mode: 0o600 });
+      fsImpl = new Proxy(fs, {
+        get(target, property) {
+          if (property === "lstatSync" || property === "fstatSync") {
+            return (...args) => {
+              const stat = target[property](...args);
+              return new Proxy(stat, {
+                get(statTarget, statProperty) {
+                  if (statProperty === "uid") return statTarget.uid + 1;
+                  const value = Reflect.get(statTarget, statProperty);
+                  return typeof value === "function" ? value.bind(statTarget) : value;
+                },
+              });
+            };
+          }
+          const value = Reflect.get(target, property);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+    } else if (scenario === "oversize") {
+      fs.writeFileSync(rollbackPath, rollbackRecord(content), { mode: 0o600 });
+      fsImpl = new Proxy(fs, {
+        get(target, property) {
+          if (property === "lstatSync") {
+            return (targetPath) => {
+              const stat = target.lstatSync(targetPath);
+              if (targetPath !== rollbackPath) return stat;
+              return new Proxy(stat, {
+                get(statTarget, statProperty) {
+                  if (statProperty === "size") return 64 * 1024 * 1024 + 1;
+                  const value = Reflect.get(statTarget, statProperty);
+                  return typeof value === "function" ? value.bind(statTarget) : value;
+                },
+              });
+            };
+          }
+          if (property === "readFileSync") {
+            return (targetPath, ...args) => {
+              if (targetPath === rollbackPath) throw new Error("oversize recovery record was read");
+              return target.readFileSync(targetPath, ...args);
+            };
+          }
+          const value = Reflect.get(target, property);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+    } else {
+      fs.writeFileSync(rollbackPath, "not-json\n", { mode: 0o600 });
+    }
+
+    const registry = createRegistry({ filePath, fsImpl });
+    assert.throws(
+      () => registry.load(),
+      (error) => error.code === "registry_persist_failed",
+    );
+    assert.equal(registry.all().length, 0);
+  });
+}
+
+test("FIFO recovery record is rejected without blocking", () => {
+  const { filePath, rollbackPath } = seedRollbackFixture();
+  execFileSync("mkfifo", [rollbackPath]);
+  const registryUrl = new URL("../src/registry.js", import.meta.url).href;
+  const script = `
+    import { createRegistry } from ${JSON.stringify(registryUrl)};
+    try {
+      createRegistry({ filePath: ${JSON.stringify(filePath)} }).load();
+      process.exit(2);
+    } catch (error) {
+      process.exit(error.code === "registry_persist_failed" ? 0 : 3);
+    }
+  `;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+    timeout: 1_000,
+  });
+  assert.equal(child.signal, null, child.stderr?.toString());
+  assert.equal(child.status, 0, child.stderr?.toString());
 });
 
 test("failed durable replacement preserves a stale foreign owner", () => {

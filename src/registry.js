@@ -7,14 +7,16 @@ export const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 export const MAX_DESCRIPTION_LEN = 500;
 export const MAX_META_BYTES = 2048;
 const RECOVERY_VERSION = 1;
+const COMMIT_VERSION = 1;
+export const MAX_RECOVERY_RECORD_BYTES = 64 * 1024 * 1024;
 
 export class RegistryPersistenceError extends Error {
-  constructor(message, { cause, recoveryError } = {}) {
+  constructor(message, { cause, recoveryError, recoveryPending = false } = {}) {
     super(message, { cause });
     this.name = "RegistryPersistenceError";
     this.code = "registry_persist_failed";
     this.status = 503;
-    this.recoveryPending = Boolean(recoveryError);
+    this.recoveryPending = recoveryPending || Boolean(recoveryError);
     if (recoveryError) this.recoveryError = recoveryError;
   }
 }
@@ -58,6 +60,8 @@ export function createRegistry({ filePath, log, now = () => Date.now(), fsImpl =
   const restorePath = `${filePath}.restore`;
   const rollbackPath = `${filePath}.rollback`;
   const rollbackTempPath = `${filePath}.rollback.tmp`;
+  const commitPath = `${filePath}.commit`;
+  const commitTempPath = `${filePath}.commit.tmp`;
 
   function pathExists(targetPath) {
     return fsImpl.existsSync(targetPath);
@@ -79,6 +83,115 @@ export function createRegistry({ filePath, log, now = () => Date.now(), fsImpl =
       fsImpl.closeSync(fd);
     } catch {
       // The original write/fsync error remains authoritative.
+    }
+  }
+
+  function recoveryError(message, cause) {
+    return new RegistryPersistenceError(message, { cause });
+  }
+
+  function validateRecoveryStat(stat, label) {
+    if (!stat.isFile()) throw recoveryError(`${label} must be a regular file`);
+    if (typeof process.getuid !== "function" || stat.uid !== process.getuid()) {
+      throw recoveryError(`${label} must be owned by the current user`);
+    }
+    if ((stat.mode & 0o777) !== 0o600) throw recoveryError(`${label} mode must be 0600`);
+    if (stat.size > MAX_RECOVERY_RECORD_BYTES) throw recoveryError(`${label} exceeds the size limit`);
+  }
+
+  function lstatIfPresent(targetPath) {
+    try {
+      return fsImpl.lstatSync(targetPath);
+    } catch (err) {
+      if (err.code === "ENOENT") return null;
+      throw recoveryError(`unable to inspect recovery path ${targetPath}: ${err.message}`, err);
+    }
+  }
+
+  function readRecoveryFile(targetPath, label) {
+    const pathStat = lstatIfPresent(targetPath);
+    if (!pathStat) return null;
+    validateRecoveryStat(pathStat, label);
+
+    let fd;
+    try {
+      const flags =
+        fsImpl.constants.O_RDONLY |
+        (fsImpl.constants.O_NOFOLLOW ?? 0) |
+        (fsImpl.constants.O_NONBLOCK ?? 0);
+      fd = fsImpl.openSync(targetPath, flags);
+      const descriptorStat = fsImpl.fstatSync(fd);
+      validateRecoveryStat(descriptorStat, label);
+      const currentPathStat = fsImpl.lstatSync(targetPath);
+      validateRecoveryStat(currentPathStat, label);
+      if (
+        descriptorStat.dev !== pathStat.dev ||
+        descriptorStat.ino !== pathStat.ino ||
+        descriptorStat.size !== pathStat.size ||
+        currentPathStat.dev !== descriptorStat.dev ||
+        currentPathStat.ino !== descriptorStat.ino ||
+        currentPathStat.size !== descriptorStat.size
+      ) {
+        throw recoveryError(`${label} changed while it was being opened`);
+      }
+
+      const contents = Buffer.alloc(descriptorStat.size);
+      let offset = 0;
+      while (offset < contents.length) {
+        const bytesRead = fsImpl.readSync(
+          fd,
+          contents,
+          offset,
+          contents.length - offset,
+          offset,
+        );
+        if (bytesRead === 0) break;
+        offset += bytesRead;
+      }
+      const extraByte = Buffer.alloc(1);
+      const grewWhileReading = fsImpl.readSync(fd, extraByte, 0, 1, descriptorStat.size) !== 0;
+      const afterReadStat = fsImpl.fstatSync(fd);
+      validateRecoveryStat(afterReadStat, label);
+      const afterReadPathStat = fsImpl.lstatSync(targetPath);
+      validateRecoveryStat(afterReadPathStat, label);
+      if (
+        offset !== descriptorStat.size ||
+        grewWhileReading ||
+        afterReadStat.dev !== descriptorStat.dev ||
+        afterReadStat.ino !== descriptorStat.ino ||
+        afterReadStat.size !== descriptorStat.size ||
+        afterReadPathStat.dev !== descriptorStat.dev ||
+        afterReadPathStat.ino !== descriptorStat.ino ||
+        afterReadPathStat.size !== descriptorStat.size
+      ) {
+        throw recoveryError(`${label} changed while it was being read`);
+      }
+      return {
+        text: contents.toString("utf8"),
+        identity: {
+          dev: descriptorStat.dev,
+          ino: descriptorStat.ino,
+          size: descriptorStat.size,
+        },
+      };
+    } catch (err) {
+      if (err instanceof RegistryPersistenceError) throw err;
+      throw recoveryError(`unable to read ${label}: ${err.message}`, err);
+    } finally {
+      closeIgnoringError(fd);
+    }
+  }
+
+  function assertRecoveryPathIdentity(targetPath, expected, label) {
+    const current = lstatIfPresent(targetPath);
+    if (!current) throw recoveryError(`${label} disappeared after it was read`);
+    validateRecoveryStat(current, label);
+    if (
+      current.dev !== expected.dev ||
+      current.ino !== expected.ino ||
+      current.size !== expected.size
+    ) {
+      throw recoveryError(`${label} changed after it was read`);
     }
   }
 
@@ -129,6 +242,31 @@ export function createRegistry({ filePath, log, now = () => Date.now(), fsImpl =
     })}\n`;
   }
 
+  function encodeCommit(snapshot) {
+    return `${JSON.stringify({
+      commitVersion: COMMIT_VERSION,
+      snapshotSha256: crypto.createHash("sha256").update(snapshot).digest("hex"),
+    })}\n`;
+  }
+
+  function decodeCommit(text) {
+    let value;
+    try {
+      value = JSON.parse(text);
+    } catch (err) {
+      throw recoveryError(`invalid registry commit marker: ${err.message}`, err);
+    }
+    if (
+      !value ||
+      value.commitVersion !== COMMIT_VERSION ||
+      typeof value.snapshotSha256 !== "string" ||
+      !/^[0-9a-f]{64}$/.test(value.snapshotSha256)
+    ) {
+      throw recoveryError("invalid registry commit marker shape");
+    }
+    return value;
+  }
+
   function decodeRollback(text) {
     let value;
     try {
@@ -157,13 +295,25 @@ export function createRegistry({ filePath, log, now = () => Date.now(), fsImpl =
 
   function cleanupStagingFiles() {
     let changed = false;
-    for (const targetPath of [nextPath, restorePath, rollbackTempPath]) {
+    for (const targetPath of [nextPath, restorePath, rollbackTempPath, commitTempPath]) {
       changed = unlinkIfPresent(targetPath) || changed;
     }
     if (changed) fsyncDirectory();
   }
 
-  function restorePreviousSnapshot(previous) {
+  function installRollbackRecord(previous) {
+    unlinkIfPresent(rollbackTempPath);
+    writeSyncedExclusive(rollbackTempPath, encodeRollback(previous));
+    fsImpl.renameSync(rollbackTempPath, rollbackPath);
+    fsyncDirectory();
+  }
+
+  function ensureRollbackRecord(previous) {
+    if (lstatIfPresent(rollbackPath)) return;
+    installRollbackRecord(previous);
+  }
+
+  function restorePreviousSnapshot(previous, { retainRollback = false } = {}) {
     unlinkIfPresent(restorePath);
     if (previous.exists) {
       writeSyncedExclusive(restorePath, previous.content);
@@ -172,18 +322,43 @@ export function createRegistry({ filePath, log, now = () => Date.now(), fsImpl =
       unlinkIfPresent(filePath);
     }
     fsyncDirectory();
-    const removedRollback = unlinkIfPresent(rollbackPath);
-    if (removedRollback) fsyncDirectory();
+    if (!retainRollback) {
+      const removedCommit = unlinkIfPresent(commitPath);
+      if (removedCommit) fsyncDirectory();
+      const removedRollback = unlinkIfPresent(rollbackPath);
+      if (removedRollback) fsyncDirectory();
+    }
     cleanupStagingFiles();
   }
 
   function recoverInterruptedTransaction() {
     fsImpl.mkdirSync(directory, { recursive: true, mode: 0o700 });
-    if (!pathExists(rollbackPath)) {
+    const rollbackFile = readRecoveryFile(rollbackPath, "registry rollback record");
+    const commitFile = readRecoveryFile(commitPath, "registry commit marker");
+    if (rollbackFile === null && commitFile === null) {
       cleanupStagingFiles();
       return false;
     }
-    const previous = decodeRollback(fsImpl.readFileSync(rollbackPath, "utf8"));
+    if (rollbackFile === null) {
+      const commit = decodeCommit(commitFile.text);
+      const snapshotFile = readRecoveryFile(filePath, "committed registry snapshot");
+      if (!snapshotFile) throw recoveryError("committed registry snapshot is missing");
+      const digest = crypto.createHash("sha256").update(snapshotFile.text).digest("hex");
+      if (digest !== commit.snapshotSha256) {
+        throw recoveryError("committed registry snapshot checksum mismatch");
+      }
+      assertRecoveryPathIdentity(
+        filePath,
+        snapshotFile.identity,
+        "committed registry snapshot",
+      );
+      fsImpl.unlinkSync(commitPath);
+      fsyncDirectory();
+      cleanupStagingFiles();
+      return true;
+    }
+
+    const previous = decodeRollback(rollbackFile.text);
     try {
       restorePreviousSnapshot(previous);
       log?.warn?.("registry", `recovered interrupted registry transaction for ${filePath}`);
@@ -213,12 +388,15 @@ export function createRegistry({ filePath, log, now = () => Date.now(), fsImpl =
     }
 
     try {
-      writeSyncedExclusive(rollbackTempPath, encodeRollback(previous));
-      fsImpl.renameSync(rollbackTempPath, rollbackPath);
+      installRollbackRecord(previous);
+
+      const snapshot = snapshotText(records);
+      writeSyncedExclusive(nextPath, snapshot);
+      fsImpl.renameSync(nextPath, filePath);
       fsyncDirectory();
 
-      writeSyncedExclusive(nextPath, snapshotText(records));
-      fsImpl.renameSync(nextPath, filePath);
+      writeSyncedExclusive(commitTempPath, encodeCommit(snapshot));
+      fsImpl.renameSync(commitTempPath, commitPath);
       fsyncDirectory();
 
       fsImpl.unlinkSync(rollbackPath);
@@ -228,7 +406,8 @@ export function createRegistry({ filePath, log, now = () => Date.now(), fsImpl =
       log?.error?.("registry", `failed to persist registry: ${err.message}`);
       let recoveryError;
       try {
-        restorePreviousSnapshot(previous);
+        ensureRollbackRecord(previous);
+        restorePreviousSnapshot(previous, { retainRollback: true });
       } catch (restoreError) {
         recoveryError = restoreError;
         log?.error?.("registry", `registry rollback remains pending: ${restoreError.message}`);
@@ -236,6 +415,7 @@ export function createRegistry({ filePath, log, now = () => Date.now(), fsImpl =
       throw new RegistryPersistenceError(`failed to persist registry: ${err.message}`, {
         cause: err,
         recoveryError,
+        recoveryPending: true,
       });
     }
   }

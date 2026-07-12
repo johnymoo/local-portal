@@ -100,7 +100,7 @@ async function setupServer(overrides = {}) {
   let lastScan = { ports: new Map(), source: "ss", at: new Date().toISOString() };
 
   const scanner = {
-    isPortFree: async (port) => !occupied.has(port),
+    isPortFree: overrides.isPortFree ?? (async (port) => !occupied.has(port)),
     isListening: async (port) => listening.has(port),
   };
 
@@ -233,7 +233,7 @@ test("POST /api/register returns structured 503 without a ghost allocation on pe
     const body = await res.json();
     assert.equal(body.error.code, "registry_persist_failed");
     assert.equal(body.error.retryable, true);
-    assert.equal(body.error.recoveryPending, false);
+    assert.equal(body.error.recoveryPending, true);
     assert.equal(ctx.registry.getByPort(20000), null);
 
     const restarted = createRegistry({ filePath: registryPath });
@@ -509,6 +509,63 @@ test("failed stale-port takeover keeps the foreign registration and returns 503"
     assert.equal(res.status, 503);
     assert.equal((await res.json()).error.code, "registry_persist_failed");
     assert.equal(ctx.registry.getByPort(20000)?.name, "foreign-owner");
+  } finally {
+    await ctx.close();
+  }
+});
+
+test("same-name reregister cannot race a stale foreign replacement to two successes", async () => {
+  const registryPath = tmpRegistryPath();
+  const seed = createRegistry({ filePath: registryPath, now: () => 1_000_000 });
+  seed.register({ name: "old-owner", port: 20000 });
+  seed.applyScan(
+    new Set(),
+    new Map(),
+    { pendingGraceSec: 0, staleGraceSec: 90, staleEvictSec: 86400 },
+    1_001_000,
+  );
+  seed.persist();
+
+  let announceProbe;
+  const probeEntered = new Promise((resolve) => {
+    announceProbe = resolve;
+  });
+  let allowProbe;
+  const probeGate = new Promise((resolve) => {
+    allowProbe = resolve;
+  });
+  const ctx = await setupServer({
+    registryPath,
+    isPortFree: async () => {
+      announceProbe();
+      await probeGate;
+      return true;
+    },
+  });
+  try {
+    const replacement = fetch(`${ctx.apiBase}/api/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "replacement", preferredPort: 20000 }),
+    });
+    await probeEntered;
+    const reregister = fetch(`${ctx.apiBase}/api/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "old-owner", preferredPort: 20000 }),
+    });
+    for (let turn = 0; turn < 20; turn += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    const reregisterMutatedWhileReplacementWasProbing =
+      ctx.registry.getByPort(20000)?.status === "pending";
+    allowProbe();
+
+    const [replacementResult, reregisterResult] = await Promise.all([replacement, reregister]);
+    assert.equal(replacementResult.status, 201);
+    assert.equal(reregisterResult.status, 409);
+    assert.equal(reregisterMutatedWhileReplacementWasProbing, false);
+    assert.equal(ctx.registry.getByPort(20000)?.name, "replacement");
   } finally {
     await ctx.close();
   }

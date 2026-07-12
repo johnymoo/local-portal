@@ -253,55 +253,47 @@ async function handleRegister(req, res, ctx) {
     body.preferredPort === undefined || body.preferredPort === null ? null : body.preferredPort;
   const another = body.another === true;
 
-  // idempotent shortcuts, evaluated before touching the allocator
-  if (preferredPort !== null) {
-    const existing = registry.getByPort(preferredPort);
-    if (existing && existing.name === name) {
-      let rec;
-      try {
-        rec = registry.reregister(preferredPort);
-      } catch (err) {
-        if (err.code === "registry_persist_failed") return sendRegistryPersistenceError(res, err);
-        throw err;
-      }
-      return sendJson(res, 200, {
-        ok: true,
-        existing: true,
-        granted: grantedView(rec, config.pendingGraceSec),
-        next_steps: nextSteps(rec, apiBase, config.pendingGraceSec),
-      });
-    }
-  } else if (!another) {
-    const existingForName = registry.getByName(name);
-    if (existingForName.length > 0) {
-      const rec = existingForName[existingForName.length - 1];
-      return sendJson(res, 200, {
-        ok: true,
-        existing: true,
-        granted: grantedView(rec, config.pendingGraceSec),
-        next_steps: nextSteps(rec, apiBase, config.pendingGraceSec),
-      });
-    }
-  }
-
   try {
-    const record = await allocator.withLock(async () => {
+    const result = await allocator.withLock(async () => {
+      if (preferredPort !== null) {
+        const existing = registry.getByPort(preferredPort);
+        if (existing && existing.name === name) {
+          return {
+            status: 200,
+            existing: true,
+            record: registry.reregister(preferredPort),
+          };
+        }
+      } else if (!another) {
+        const existingForName = registry.getByName(name);
+        if (existingForName.length > 0) {
+          return {
+            status: 200,
+            existing: true,
+            record: existingForName[existingForName.length - 1],
+          };
+        }
+      }
+
       const { port } = await allocator.grant({ name, preferredPort: preferredPort ?? undefined });
-      const rec = registry.register({
-        name,
-        description,
-        port,
-        requestedPort: preferredPort,
-        meta,
-      });
-      return rec;
+      return {
+        status: 201,
+        existing: false,
+        record: registry.register({
+          name,
+          description,
+          port,
+          requestedPort: preferredPort,
+          meta,
+        }),
+      };
     });
 
-    return sendJson(res, 201, {
+    return sendJson(res, result.status, {
       ok: true,
-      existing: false,
-      granted: grantedView(record, config.pendingGraceSec),
-      next_steps: nextSteps(record, apiBase, config.pendingGraceSec),
+      existing: result.existing,
+      granted: grantedView(result.record, config.pendingGraceSec),
+      next_steps: nextSteps(result.record, apiBase, config.pendingGraceSec),
     });
   } catch (err) {
     switch (err.code) {
@@ -314,6 +306,8 @@ async function handleRegister(req, res, ctx) {
           hint: "omit preferredPort to get an allocation, or pick another port",
         });
       case "port_registered":
+        return sendError(res, 409, err.code, err.message, { owner: err.owner, status: err.status });
+      case "allocation_changed":
         return sendError(res, 409, err.code, err.message, { owner: err.owner, status: err.status });
       case "port_unmanaged":
         return sendError(res, 409, err.code, err.message, { process: err.process });
@@ -337,7 +331,7 @@ async function handleRelease(req, res, ctx) {
     return sendError(res, err.status ?? 400, err.code ?? "bad_json", err.message);
   }
 
-  const { registry } = ctx;
+  const { registry, allocator } = ctx;
   const { name, port, force } = body;
 
   if (!Number.isInteger(port)) {
@@ -347,23 +341,34 @@ async function handleRelease(req, res, ctx) {
     return sendError(res, 400, "invalid_name", "name is required");
   }
 
-  const record = registry.getByPort(port);
-  if (!record) {
-    return sendError(res, 404, "not_found", `no registration found for port ${port}`);
-  }
-  if (record.name !== name && force !== true) {
-    return sendError(res, 403, "name_mismatch", `port ${port} is registered to "${record.name}", not "${name}"`, {
-      owner: record.name,
-    });
-  }
-
   try {
-    registry.release(port);
+    const result = await allocator.withLock(async () => {
+      const record = registry.getByPort(port);
+      if (!record) return { kind: "not_found" };
+      if (record.name !== name && force !== true) {
+        return { kind: "name_mismatch", owner: record.name };
+      }
+      registry.release(port);
+      return { kind: "released", record };
+    });
+
+    if (result.kind === "not_found") {
+      return sendError(res, 404, "not_found", `no registration found for port ${port}`);
+    }
+    if (result.kind === "name_mismatch") {
+      return sendError(
+        res,
+        403,
+        "name_mismatch",
+        `port ${port} is registered to "${result.owner}", not "${name}"`,
+        { owner: result.owner },
+      );
+    }
+    return sendJson(res, 200, { ok: true, released: { name: result.record.name, port } });
   } catch (err) {
     if (err.code === "registry_persist_failed") return sendRegistryPersistenceError(res, err);
     throw err;
   }
-  return sendJson(res, 200, { ok: true, released: { name: record.name, port } });
 }
 
 /**
@@ -439,7 +444,7 @@ export function createApiServer(deps) {
 
     if (pathname === "/api/release") {
       if (method !== "POST") return methodNotAllowed(res, ["POST"]);
-      return handleRelease(req, res, { registry });
+      return handleRelease(req, res, { registry, allocator });
     }
 
     if (pathname === "/api/agent-guide") {
