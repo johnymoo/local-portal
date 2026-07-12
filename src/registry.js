@@ -9,6 +9,17 @@ export const MAX_META_BYTES = 2048;
 const RECOVERY_VERSION = 1;
 const COMMIT_VERSION = 1;
 export const MAX_RECOVERY_RECORD_BYTES = 64 * 1024 * 1024;
+const ROLLBACK_ENVELOPE_BYTES = Buffer.byteLength(
+  `${JSON.stringify({
+    recoveryVersion: RECOVERY_VERSION,
+    targetExisted: true,
+    contentBase64: "",
+    sha256: "0".repeat(64),
+  })}\n`,
+  "utf8",
+);
+export const MAX_REGISTRY_BYTES =
+  Math.floor((MAX_RECOVERY_RECORD_BYTES - ROLLBACK_ENVELOPE_BYTES) / 4) * 3;
 
 export class RegistryPersistenceError extends Error {
   constructor(message, { cause, recoveryError, recoveryPending = false } = {}) {
@@ -63,10 +74,6 @@ export function createRegistry({ filePath, log, now = () => Date.now(), fsImpl =
   const commitPath = `${filePath}.commit`;
   const commitTempPath = `${filePath}.commit.tmp`;
 
-  function pathExists(targetPath) {
-    return fsImpl.existsSync(targetPath);
-  }
-
   function unlinkIfPresent(targetPath) {
     try {
       fsImpl.unlinkSync(targetPath);
@@ -77,12 +84,13 @@ export function createRegistry({ filePath, log, now = () => Date.now(), fsImpl =
     }
   }
 
-  function closeIgnoringError(fd) {
+  function closeOwnedFd(fd, primaryError) {
     if (fd === undefined) return;
     try {
       fsImpl.closeSync(fd);
-    } catch {
-      // The original write/fsync error remains authoritative.
+    } catch (closeError) {
+      if (!primaryError) throw closeError;
+      primaryError.closeErrors = [...(primaryError.closeErrors ?? []), closeError];
     }
   }
 
@@ -90,13 +98,13 @@ export function createRegistry({ filePath, log, now = () => Date.now(), fsImpl =
     return new RegistryPersistenceError(message, { cause });
   }
 
-  function validateRecoveryStat(stat, label) {
+  function validateRecoveryStat(stat, label, maxBytes = MAX_RECOVERY_RECORD_BYTES) {
     if (!stat.isFile()) throw recoveryError(`${label} must be a regular file`);
     if (typeof process.getuid !== "function" || stat.uid !== process.getuid()) {
       throw recoveryError(`${label} must be owned by the current user`);
     }
     if ((stat.mode & 0o777) !== 0o600) throw recoveryError(`${label} mode must be 0600`);
-    if (stat.size > MAX_RECOVERY_RECORD_BYTES) throw recoveryError(`${label} exceeds the size limit`);
+    if (stat.size > maxBytes) throw recoveryError(`${label} exceeds the size limit`);
   }
 
   function lstatIfPresent(targetPath) {
@@ -108,12 +116,17 @@ export function createRegistry({ filePath, log, now = () => Date.now(), fsImpl =
     }
   }
 
-  function readRecoveryFile(targetPath, label) {
+  function readRecoveryFile(
+    targetPath,
+    label,
+    { maxBytes = MAX_RECOVERY_RECORD_BYTES } = {},
+  ) {
     const pathStat = lstatIfPresent(targetPath);
     if (!pathStat) return null;
-    validateRecoveryStat(pathStat, label);
+    validateRecoveryStat(pathStat, label, maxBytes);
 
     let fd;
+    let primaryError;
     try {
       const flags =
         fsImpl.constants.O_RDONLY |
@@ -121,9 +134,9 @@ export function createRegistry({ filePath, log, now = () => Date.now(), fsImpl =
         (fsImpl.constants.O_NONBLOCK ?? 0);
       fd = fsImpl.openSync(targetPath, flags);
       const descriptorStat = fsImpl.fstatSync(fd);
-      validateRecoveryStat(descriptorStat, label);
+      validateRecoveryStat(descriptorStat, label, maxBytes);
       const currentPathStat = fsImpl.lstatSync(targetPath);
-      validateRecoveryStat(currentPathStat, label);
+      validateRecoveryStat(currentPathStat, label, maxBytes);
       if (
         descriptorStat.dev !== pathStat.dev ||
         descriptorStat.ino !== pathStat.ino ||
@@ -151,9 +164,9 @@ export function createRegistry({ filePath, log, now = () => Date.now(), fsImpl =
       const extraByte = Buffer.alloc(1);
       const grewWhileReading = fsImpl.readSync(fd, extraByte, 0, 1, descriptorStat.size) !== 0;
       const afterReadStat = fsImpl.fstatSync(fd);
-      validateRecoveryStat(afterReadStat, label);
+      validateRecoveryStat(afterReadStat, label, maxBytes);
       const afterReadPathStat = fsImpl.lstatSync(targetPath);
-      validateRecoveryStat(afterReadPathStat, label);
+      validateRecoveryStat(afterReadPathStat, label, maxBytes);
       if (
         offset !== descriptorStat.size ||
         grewWhileReading ||
@@ -175,10 +188,17 @@ export function createRegistry({ filePath, log, now = () => Date.now(), fsImpl =
         },
       };
     } catch (err) {
-      if (err instanceof RegistryPersistenceError) throw err;
-      throw recoveryError(`unable to read ${label}: ${err.message}`, err);
+      primaryError =
+        err instanceof RegistryPersistenceError
+          ? err
+          : recoveryError(`unable to read ${label}: ${err.message}`, err);
+      throw primaryError;
     } finally {
-      closeIgnoringError(fd);
+      try {
+        closeOwnedFd(fd, primaryError);
+      } catch (closeError) {
+        throw recoveryError(`unable to close ${label}: ${closeError.message}`, closeError);
+      }
     }
   }
 
@@ -197,16 +217,21 @@ export function createRegistry({ filePath, log, now = () => Date.now(), fsImpl =
 
   function fsyncDirectory() {
     let fd;
+    let primaryError;
     try {
       fd = fsImpl.openSync(directory, "r");
       fsImpl.fsyncSync(fd);
+    } catch (err) {
+      primaryError = err;
+      throw err;
     } finally {
-      closeIgnoringError(fd);
+      closeOwnedFd(fd, primaryError);
     }
   }
 
   function writeSyncedExclusive(targetPath, contents) {
     let fd;
+    let primaryError;
     try {
       fd = fsImpl.openSync(
         targetPath,
@@ -215,8 +240,17 @@ export function createRegistry({ filePath, log, now = () => Date.now(), fsImpl =
       );
       fsImpl.writeFileSync(fd, contents, "utf8");
       fsImpl.fsyncSync(fd);
+    } catch (err) {
+      primaryError = err;
+      throw err;
     } finally {
-      closeIgnoringError(fd);
+      closeOwnedFd(fd, primaryError);
+    }
+  }
+
+  function assertTextWithinLimit(contents, maxBytes, label) {
+    if (Buffer.byteLength(contents, "utf8") > maxBytes) {
+      throw recoveryError(`${label} exceeds the size limit`);
     }
   }
 
@@ -234,12 +268,14 @@ export function createRegistry({ filePath, log, now = () => Date.now(), fsImpl =
 
   function encodeRollback(previous) {
     const content = previous.exists ? previous.content : "";
-    return `${JSON.stringify({
+    const encoded = `${JSON.stringify({
       recoveryVersion: RECOVERY_VERSION,
       targetExisted: previous.exists,
       contentBase64: Buffer.from(content, "utf8").toString("base64"),
       sha256: crypto.createHash("sha256").update(content).digest("hex"),
     })}\n`;
+    assertTextWithinLimit(encoded, MAX_RECOVERY_RECORD_BYTES, "registry rollback record");
+    return encoded;
   }
 
   function encodeCommit(snapshot) {
@@ -341,7 +377,9 @@ export function createRegistry({ filePath, log, now = () => Date.now(), fsImpl =
     }
     if (rollbackFile === null) {
       const commit = decodeCommit(commitFile.text);
-      const snapshotFile = readRecoveryFile(filePath, "committed registry snapshot");
+      const snapshotFile = readRecoveryFile(filePath, "committed registry snapshot", {
+        maxBytes: MAX_REGISTRY_BYTES,
+      });
       if (!snapshotFile) throw recoveryError("committed registry snapshot is missing");
       const digest = crypto.createHash("sha256").update(snapshotFile.text).digest("hex");
       if (digest !== commit.snapshotSha256) {
@@ -372,13 +410,18 @@ export function createRegistry({ filePath, log, now = () => Date.now(), fsImpl =
   }
 
   function persistSnapshot(records) {
+    const snapshot = snapshotText(records);
+    assertTextWithinLimit(snapshot, MAX_REGISTRY_BYTES, "registry snapshot");
+
     let previous;
     try {
       fsImpl.mkdirSync(directory, { recursive: true, mode: 0o700 });
       recoverInterruptedTransaction();
-      previous = pathExists(filePath)
-        ? { exists: true, content: fsImpl.readFileSync(filePath, "utf8") }
+      const previousFile = readRecoveryFile(filePath, "existing registry snapshot");
+      previous = previousFile
+        ? { exists: true, content: previousFile.text }
         : { exists: false, content: "" };
+      assertTextWithinLimit(previous.content, MAX_REGISTRY_BYTES, "existing registry snapshot");
     } catch (err) {
       if (err instanceof RegistryPersistenceError) throw err;
       log?.error?.("registry", `failed to prepare registry transaction: ${err.message}`);
@@ -390,7 +433,6 @@ export function createRegistry({ filePath, log, now = () => Date.now(), fsImpl =
     try {
       installRollbackRecord(previous);
 
-      const snapshot = snapshotText(records);
       writeSyncedExclusive(nextPath, snapshot);
       fsImpl.renameSync(nextPath, filePath);
       fsyncDirectory();

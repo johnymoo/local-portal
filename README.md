@@ -58,8 +58,19 @@ npm start
 
 注册和释放只有在 registry 临时文件、原子替换和父目录都完成 `fsync` 后才返回 2xx。
 持久化失败返回 `503`，错误码为 `registry_persist_failed`，原有内存和磁盘状态保持不变。
-进程若在提交中断，下一次启动会用同目录的内部 `.rollback` 记录恢复最后一个已确认状态；
-不要手工编辑或删除 registry 的 `.next`、`.restore`、`.rollback` 文件。
+进程若在提交中断，下一次启动会用同目录的内部恢复记录回到最后一个已确认状态。事务期间
+可能出现以下文件（均以 `registry.json` 的完整路径为前缀）：
+
+- `.next`：准备原子替换的下一版 registry snapshot。
+- `.restore`：恢复旧 snapshot 时使用的临时文件。
+- `.rollback.tmp`：尚未原子发布的 rollback 临时文件。
+- `.rollback`：包含旧 snapshot 的持久恢复记录；它存在时，启动恢复以旧状态为准。
+- `.commit.tmp`：尚未原子发布的 commit marker 临时文件。
+- `.commit`：已持久提交的新 snapshot 摘要；成功响应后可能保留到下一次启动或 mutation，
+  届时校验主 registry 后清理。
+
+这些文件属于内部事务协议。不要手工编辑、移动或删除其中任何一个，否则服务会 fail closed，
+并返回 `registry_persist_failed`，而不是猜测应该接受哪个 snapshot。
 
 完整的请求/响应细节、错误码和状态机见各模块源码顶部注释与 `src/api.js`。
 

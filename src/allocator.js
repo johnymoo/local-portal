@@ -13,10 +13,9 @@ function isValidPreferredPort(n) {
 /**
  * Port grant logic: preferredPort validation/conflict/eviction, or
  * first-fit auto-allocation over allocRange. Always bind-tests before
- * granting. Does NOT touch the registry's own records other than evicting a
- * stale one that blocks a requested preferredPort — creating the new
- * registration record is the caller's job (see withLock below), so
- * grant+register can be done atomically under one lock hold.
+ * granting. Does not mutate registry records: the caller replaces a stale
+ * owner by writing the new registration (see withLock below), so the complete
+ * ownership decision and durable mutation share one lock hold.
  */
 export function createAllocator({ registry, scanner, guardPorts, allocRange, apiPort, getLastScan, log }) {
   let queue = Promise.resolve();

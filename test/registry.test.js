@@ -206,6 +206,73 @@ function failRollbackRemovalOnce(filePath) {
   });
 }
 
+function failNextClose(filePath, { failFsync = false } = {}) {
+  const fdPaths = new Map();
+  let fsyncFailed = false;
+  let closeFailed = false;
+  return new Proxy(fs, {
+    get(target, property) {
+      if (property === "openSync") {
+        return (targetPath, flags, mode) => {
+          const fd = target.openSync(targetPath, flags, mode);
+          fdPaths.set(fd, targetPath);
+          return fd;
+        };
+      }
+      if (property === "fsyncSync") {
+        return (fd) => {
+          if (failFsync && !fsyncFailed && fdPaths.get(fd) === `${filePath}.next`) {
+            fsyncFailed = true;
+            const error = new Error("injected next snapshot fsync failure");
+            error.code = "EIO";
+            throw error;
+          }
+          return target.fsyncSync(fd);
+        };
+      }
+      if (property === "closeSync") {
+        return (fd) => {
+          const targetPath = fdPaths.get(fd);
+          fdPaths.delete(fd);
+          const result = target.closeSync(fd);
+          if (!closeFailed && targetPath === `${filePath}.next`) {
+            closeFailed = true;
+            const error = new Error("injected next snapshot close failure");
+            error.code = "EIO";
+            throw error;
+          }
+          return result;
+        };
+      }
+      const value = Reflect.get(target, property);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+function largeRegistrySnapshot(payloadBytes = 49 * 1024 * 1024) {
+  return `${JSON.stringify({
+    schemaVersion: 1,
+    updatedAt: new Date(1_000_000).toISOString(),
+    registrations: [
+      {
+        id: "reg_large",
+        name: "large-owner",
+        description: "",
+        port: 20000,
+        requestedPort: null,
+        status: "active",
+        registeredAt: new Date(1_000_000).toISOString(),
+        lastSeenListeningAt: new Date(1_000_000).toISOString(),
+        staleSince: null,
+        observedProcess: null,
+        meta: {},
+        padding: "x".repeat(payloadBytes),
+      },
+    ],
+  })}\n`;
+}
+
 function rollbackRecord(content, targetExisted = true) {
   return `${JSON.stringify({
     recoveryVersion: 1,
@@ -255,6 +322,90 @@ test("persist + load round trip preserves records, tmp file cleaned up", () => {
   const registry2 = createRegistry({ filePath, now: c.now });
   registry2.load();
   assert.equal(registry2.getByPort(20000).name, "my-app");
+});
+
+test("oversized legacy snapshot is rejected before creating unreadable rollback evidence", () => {
+  const filePath = tmpFile();
+  fs.writeFileSync(filePath, largeRegistrySnapshot(), { mode: 0o600 });
+  const registry = createRegistry({
+    filePath,
+    now: () => 2_000_000,
+    fsImpl: failPersistenceOnce("parent-fsync", filePath),
+  });
+  registry.load();
+
+  assert.throws(
+    () => registry.release(20000),
+    (error) => error.code === "registry_persist_failed" && error.recoveryPending === false,
+  );
+  assert.equal(registry.getByPort(20000)?.name, "large-owner");
+  assert.deepEqual(fs.readdirSync(path.dirname(filePath)).sort(), [path.basename(filePath)]);
+
+  const restarted = createRegistry({ filePath, now: () => 3_000_000 });
+  restarted.load();
+  assert.equal(restarted.getByPort(20000)?.name, "large-owner");
+});
+
+test("oversized next snapshot is rejected before creating transaction artifacts", () => {
+  const filePath = tmpFile();
+  const registry = createRegistry({ filePath, now: () => 1_000_000 });
+
+  assert.throws(
+    () =>
+      registry.register({
+        name: "oversized-next",
+        description: "x".repeat(49 * 1024 * 1024),
+        port: 20000,
+      }),
+    (error) => error.code === "registry_persist_failed" && error.recoveryPending === false,
+  );
+  assert.equal(registry.getByPort(20000), null);
+  assert.deepEqual(fs.readdirSync(path.dirname(filePath)), []);
+
+  const restarted = createRegistry({ filePath });
+  restarted.load();
+  assert.equal(restarted.all().length, 0);
+});
+
+test("close failure after a synced next snapshot prevents mutation acknowledgement", () => {
+  const filePath = tmpFile();
+  const seed = createRegistry({ filePath, now: () => 1_000_000 });
+  seed.register({ name: "old-owner", port: 20000 });
+
+  const registry = createRegistry({ filePath, fsImpl: failNextClose(filePath) });
+  registry.load();
+  assert.throws(
+    () => registry.register({ name: "new-owner", port: 20001 }),
+    (error) =>
+      error.code === "registry_persist_failed" &&
+      error.cause?.message === "injected next snapshot close failure",
+  );
+  assert.equal(registry.getByPort(20001), null);
+
+  const restarted = createRegistry({ filePath });
+  restarted.load();
+  assert.equal(restarted.getByPort(20000)?.name, "old-owner");
+  assert.equal(restarted.getByPort(20001), null);
+});
+
+test("close failure is recorded without replacing the primary fsync failure", () => {
+  const filePath = tmpFile();
+  const seed = createRegistry({ filePath, now: () => 1_000_000 });
+  seed.register({ name: "old-owner", port: 20000 });
+
+  const registry = createRegistry({
+    filePath,
+    fsImpl: failNextClose(filePath, { failFsync: true }),
+  });
+  registry.load();
+  assert.throws(
+    () => registry.register({ name: "new-owner", port: 20001 }),
+    (error) =>
+      error.code === "registry_persist_failed" &&
+      error.cause?.message === "injected next snapshot fsync failure" &&
+      error.cause?.closeErrors?.[0]?.message === "injected next snapshot close failure",
+  );
+  assert.equal(registry.getByPort(20001), null);
 });
 
 for (const operation of ["register", "release"]) {

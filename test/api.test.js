@@ -72,6 +72,38 @@ function failNextSnapshotCreateOnce(filePath) {
   });
 }
 
+function failNextSnapshotCloseOnce(filePath) {
+  const fdPaths = new Map();
+  let failed = false;
+  return new Proxy(fs, {
+    get(target, property) {
+      if (property === "openSync") {
+        return (targetPath, flags, mode) => {
+          const fd = target.openSync(targetPath, flags, mode);
+          fdPaths.set(fd, targetPath);
+          return fd;
+        };
+      }
+      if (property === "closeSync") {
+        return (fd) => {
+          const targetPath = fdPaths.get(fd);
+          fdPaths.delete(fd);
+          const result = target.closeSync(fd);
+          if (!failed && targetPath === `${filePath}.next`) {
+            failed = true;
+            const error = new Error("injected next snapshot close failure");
+            error.code = "EIO";
+            throw error;
+          }
+          return result;
+        };
+      }
+      const value = Reflect.get(target, property);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
 async function setupServer(overrides = {}) {
   const apiPort = overrides.apiPort ?? (await getEphemeralPort());
   const guardPort = overrides.guardPort ?? (await getEphemeralPort());
@@ -228,6 +260,33 @@ test("POST /api/register returns structured 503 without a ghost allocation on pe
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ name: "ghost-app", preferredPort: 20000 }),
+    });
+    assert.equal(res.status, 503);
+    const body = await res.json();
+    assert.equal(body.error.code, "registry_persist_failed");
+    assert.equal(body.error.retryable, true);
+    assert.equal(body.error.recoveryPending, true);
+    assert.equal(ctx.registry.getByPort(20000), null);
+
+    const restarted = createRegistry({ filePath: registryPath });
+    restarted.load();
+    assert.equal(restarted.getByPort(20000), null);
+  } finally {
+    await ctx.close();
+  }
+});
+
+test("POST /api/register returns structured 503 when synced snapshot close fails", async () => {
+  const registryPath = tmpRegistryPath();
+  const ctx = await setupServer({
+    registryPath,
+    fsImpl: failNextSnapshotCloseOnce(registryPath),
+  });
+  try {
+    const res = await fetch(`${ctx.apiBase}/api/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "close-failure", preferredPort: 20000 }),
     });
     assert.equal(res.status, 503);
     const body = await res.json();
