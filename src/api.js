@@ -18,6 +18,16 @@ function sendError(res, status, code, message, extra = {}) {
   sendJson(res, status, { ok: false, error: { code, message, ...extra } });
 }
 
+function sendRegistryPersistenceError(res, err) {
+  return sendError(
+    res,
+    err.status ?? 503,
+    "registry_persist_failed",
+    "registry mutation was not durably committed",
+    { retryable: true, recoveryPending: err.recoveryPending === true },
+  );
+}
+
 function methodNotAllowed(res, allowed) {
   res.setHeader("Allow", allowed.join(", "));
   sendError(res, 405, "method_not_allowed", `method not allowed, use ${allowed.join(", ")}`);
@@ -247,8 +257,13 @@ async function handleRegister(req, res, ctx) {
   if (preferredPort !== null) {
     const existing = registry.getByPort(preferredPort);
     if (existing && existing.name === name) {
-      const rec = registry.reregister(preferredPort);
-      registry.persist();
+      let rec;
+      try {
+        rec = registry.reregister(preferredPort);
+      } catch (err) {
+        if (err.code === "registry_persist_failed") return sendRegistryPersistenceError(res, err);
+        throw err;
+      }
       return sendJson(res, 200, {
         ok: true,
         existing: true,
@@ -279,7 +294,6 @@ async function handleRegister(req, res, ctx) {
         requestedPort: preferredPort,
         meta,
       });
-      registry.persist();
       return rec;
     });
 
@@ -307,6 +321,8 @@ async function handleRegister(req, res, ctx) {
         return sendError(res, 503, err.code, err.message, {
           hint: "release unused ports or widen allocRange in config",
         });
+      case "registry_persist_failed":
+        return sendRegistryPersistenceError(res, err);
       default:
         throw err;
     }
@@ -341,8 +357,12 @@ async function handleRelease(req, res, ctx) {
     });
   }
 
-  registry.release(port);
-  registry.persist();
+  try {
+    registry.release(port);
+  } catch (err) {
+    if (err.code === "registry_persist_failed") return sendRegistryPersistenceError(res, err);
+    throw err;
+  }
   return sendJson(res, 200, { ok: true, released: { name: record.name, port } });
 }
 

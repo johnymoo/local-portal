@@ -49,10 +49,9 @@ export function createAllocator({ registry, scanner, guardPorts, allocRange, api
       const existing = registry.getByPort(preferredPort);
       if (existing && existing.name !== name) {
         if (existing.status === "stale") {
-          registry.release(preferredPort);
           log?.info?.(
             "allocator",
-            `evicted stale registration ${existing.name}:${preferredPort} to grant it to ${name}`,
+            `stale registration ${existing.name}:${preferredPort} will be durably replaced by ${name}`,
           );
         } else {
           throw new AllocError(

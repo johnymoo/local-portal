@@ -56,6 +56,11 @@ npm start
 - `GET /api/agent-guide` — 给 Agent 看的 Markdown 使用指南（`?format=json` 返回 JSON 包裹）
 - `GET /` — 仪表盘（浏览器打开即可看到实时状态）
 
+注册和释放只有在 registry 临时文件、原子替换和父目录都完成 `fsync` 后才返回 2xx。
+持久化失败返回 `503`，错误码为 `registry_persist_failed`，原有内存和磁盘状态保持不变。
+进程若在提交中断，下一次启动会用同目录的内部 `.rollback` 记录恢复最后一个已确认状态；
+不要手工编辑或删除 registry 的 `.next`、`.restore`、`.rollback` 文件。
+
 完整的请求/响应细节、错误码和状态机见各模块源码顶部注释与 `src/api.js`。
 
 ## 让 Agent 主动遵守（而不是等它撞上 409）

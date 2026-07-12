@@ -51,6 +51,27 @@ function tmpRegistryPath() {
   return path.join(dir, "registry.json");
 }
 
+function failNextSnapshotCreateOnce(filePath) {
+  let failed = false;
+  return new Proxy(fs, {
+    get(target, property) {
+      if (property === "openSync") {
+        return (targetPath, flags, mode) => {
+          if (!failed && targetPath === `${filePath}.next`) {
+            failed = true;
+            const error = new Error("injected next snapshot creation failure");
+            error.code = "EIO";
+            throw error;
+          }
+          return target.openSync(targetPath, flags, mode);
+        };
+      }
+      const value = Reflect.get(target, property);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
 async function setupServer(overrides = {}) {
   const apiPort = overrides.apiPort ?? (await getEphemeralPort());
   const guardPort = overrides.guardPort ?? (await getEphemeralPort());
@@ -66,7 +87,12 @@ async function setupServer(overrides = {}) {
     staleEvictSec: 86400,
   };
 
-  const registry = createRegistry({ filePath: tmpRegistryPath(), now: () => Date.now() });
+  const registryPath = overrides.registryPath ?? tmpRegistryPath();
+  const registry = createRegistry({
+    filePath: registryPath,
+    now: overrides.now ?? (() => Date.now()),
+    fsImpl: overrides.fsImpl,
+  });
   registry.load();
 
   const occupied = overrides.occupied ?? new Set();
@@ -112,6 +138,7 @@ async function setupServer(overrides = {}) {
     apiBase: `http://127.0.0.1:${apiPort}`,
     guardPort,
     registry,
+    registryPath,
     guards,
     setListening: (set) => {
       listening = set;
@@ -182,6 +209,36 @@ test("POST /api/register grants a port with the expected shape", async () => {
     assert.ok(body.granted.bindBy);
     assert.equal(body.next_steps.length, 4);
     assert.ok(body.next_steps[0].includes("20000"));
+    const restarted = createRegistry({ filePath: ctx.registryPath });
+    restarted.load();
+    assert.equal(restarted.getByPort(20000)?.id, body.granted.id);
+  } finally {
+    await ctx.close();
+  }
+});
+
+test("POST /api/register returns structured 503 without a ghost allocation on persistence failure", async () => {
+  const registryPath = tmpRegistryPath();
+  const ctx = await setupServer({
+    registryPath,
+    fsImpl: failNextSnapshotCreateOnce(registryPath),
+  });
+  try {
+    const res = await fetch(`${ctx.apiBase}/api/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "ghost-app", preferredPort: 20000 }),
+    });
+    assert.equal(res.status, 503);
+    const body = await res.json();
+    assert.equal(body.error.code, "registry_persist_failed");
+    assert.equal(body.error.retryable, true);
+    assert.equal(body.error.recoveryPending, false);
+    assert.equal(ctx.registry.getByPort(20000), null);
+
+    const restarted = createRegistry({ filePath: registryPath });
+    restarted.load();
+    assert.equal(restarted.getByPort(20000), null);
   } finally {
     await ctx.close();
   }
@@ -379,6 +436,10 @@ test("POST /api/release: name mismatch is rejected, then a correct release makes
     });
     assert.equal(ok.status, 200);
 
+    const restarted = createRegistry({ filePath: ctx.registryPath });
+    restarted.load();
+    assert.equal(restarted.getByPort(20000), null);
+
     const notFound = await fetch(`${ctx.apiBase}/api/release`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -388,6 +449,66 @@ test("POST /api/release: name mismatch is rejected, then a correct release makes
 
     const view = await (await fetch(`${ctx.apiBase}/api/ports/20000`)).json();
     assert.equal(view.state, "free");
+  } finally {
+    await ctx.close();
+  }
+});
+
+test("POST /api/release returns structured 503 and retains owner on persistence failure", async () => {
+  const registryPath = tmpRegistryPath();
+  const seed = createRegistry({ filePath: registryPath, now: () => 1_000_000 });
+  seed.register({ name: "owner-app", port: 20000 });
+  seed.persist();
+
+  const ctx = await setupServer({
+    registryPath,
+    fsImpl: failNextSnapshotCreateOnce(registryPath),
+  });
+  try {
+    const res = await fetch(`${ctx.apiBase}/api/release`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "owner-app", port: 20000 }),
+    });
+    assert.equal(res.status, 503);
+    const body = await res.json();
+    assert.equal(body.error.code, "registry_persist_failed");
+    assert.equal(ctx.registry.getByPort(20000)?.name, "owner-app");
+
+    const restarted = createRegistry({ filePath: registryPath });
+    restarted.load();
+    assert.equal(restarted.getByPort(20000)?.name, "owner-app");
+  } finally {
+    await ctx.close();
+  }
+});
+
+test("failed stale-port takeover keeps the foreign registration and returns 503", async () => {
+  const registryPath = tmpRegistryPath();
+  const seed = createRegistry({ filePath: registryPath, now: () => 1_000_000 });
+  seed.register({ name: "foreign-owner", port: 20000 });
+  seed.applyScan(
+    new Set(),
+    new Map(),
+    { pendingGraceSec: 0, staleGraceSec: 90, staleEvictSec: 86400 },
+    1_001_000,
+  );
+  seed.persist();
+  assert.equal(seed.getByPort(20000)?.status, "stale");
+
+  const ctx = await setupServer({
+    registryPath,
+    fsImpl: failNextSnapshotCreateOnce(registryPath),
+  });
+  try {
+    const res = await fetch(`${ctx.apiBase}/api/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "replacement", preferredPort: 20000 }),
+    });
+    assert.equal(res.status, 503);
+    assert.equal((await res.json()).error.code, "registry_persist_failed");
+    assert.equal(ctx.registry.getByPort(20000)?.name, "foreign-owner");
   } finally {
     await ctx.close();
   }

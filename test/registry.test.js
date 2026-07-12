@@ -18,6 +18,114 @@ function clock(startMs) {
   return { now: () => t, advance: (ms) => (t += ms), get: () => t };
 }
 
+function failPersistenceOnce(failure, filePath) {
+  const fdPaths = new Map();
+  let failed = false;
+  let mainRenamed = false;
+  const fail = () => {
+    failed = true;
+    const error = new Error(`injected ${failure}`);
+    error.code = "EIO";
+    throw error;
+  };
+
+  return new Proxy(fs, {
+    get(target, property) {
+      if (property === "openSync") {
+        return (targetPath, flags, mode) => {
+          if (!failed && failure === "temp-create" && targetPath === `${filePath}.next`) fail();
+          const fd = target.openSync(targetPath, flags, mode);
+          fdPaths.set(fd, targetPath);
+          return fd;
+        };
+      }
+      if (property === "closeSync") {
+        return (fd) => {
+          fdPaths.delete(fd);
+          return target.closeSync(fd);
+        };
+      }
+      if (property === "writeFileSync") {
+        return (targetPath, ...args) => {
+          const resolvedPath = typeof targetPath === "number" ? fdPaths.get(targetPath) : targetPath;
+          if (!failed && failure === "write" && resolvedPath === `${filePath}.next`) fail();
+          return target.writeFileSync(targetPath, ...args);
+        };
+      }
+      if (property === "fsyncSync") {
+        return (fd) => {
+          const targetPath = fdPaths.get(fd);
+          if (!failed && failure === "file-fsync" && targetPath === `${filePath}.next`) fail();
+          if (!failed && failure === "parent-fsync" && mainRenamed && targetPath === path.dirname(filePath)) fail();
+          return target.fsyncSync(fd);
+        };
+      }
+      if (property === "renameSync") {
+        return (source, destination) => {
+          if (!failed && failure === "rename" && source === `${filePath}.next` && destination === filePath) fail();
+          const result = target.renameSync(source, destination);
+          if (source === `${filePath}.next` && destination === filePath) mainRenamed = true;
+          return result;
+        };
+      }
+      const value = Reflect.get(target, property);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+function failCommitFsyncAndImmediateRollback(filePath) {
+  const fdPaths = new Map();
+  let mainRenamed = false;
+  let commitFsyncFailed = false;
+  return new Proxy(fs, {
+    get(target, property) {
+      if (property === "openSync") {
+        return (targetPath, flags, mode) => {
+          const fd = target.openSync(targetPath, flags, mode);
+          fdPaths.set(fd, targetPath);
+          return fd;
+        };
+      }
+      if (property === "closeSync") {
+        return (fd) => {
+          fdPaths.delete(fd);
+          return target.closeSync(fd);
+        };
+      }
+      if (property === "fsyncSync") {
+        return (fd) => {
+          if (!commitFsyncFailed && mainRenamed && fdPaths.get(fd) === path.dirname(filePath)) {
+            commitFsyncFailed = true;
+            const error = new Error("injected commit parent fsync failure");
+            error.code = "EIO";
+            throw error;
+          }
+          return target.fsyncSync(fd);
+        };
+      }
+      if (property === "renameSync") {
+        return (source, destination) => {
+          if (source === `${filePath}.restore` && destination === filePath) {
+            const error = new Error("injected immediate rollback failure");
+            error.code = "EIO";
+            throw error;
+          }
+          const result = target.renameSync(source, destination);
+          if (source === `${filePath}.next` && destination === filePath) mainRenamed = true;
+          return result;
+        };
+      }
+      const value = Reflect.get(target, property);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+function assertOnlyRegistryFileRemains(filePath) {
+  assert.deepEqual(fs.readdirSync(path.dirname(filePath)).sort(), [path.basename(filePath)]);
+}
+
 test("register creates a pending record", () => {
   const filePath = tmpFile();
   const c = clock(1_000_000);
@@ -46,6 +154,104 @@ test("persist + load round trip preserves records, tmp file cleaned up", () => {
   const registry2 = createRegistry({ filePath, now: c.now });
   registry2.load();
   assert.equal(registry2.getByPort(20000).name, "my-app");
+});
+
+for (const operation of ["register", "release"]) {
+  for (const failure of ["temp-create", "write", "file-fsync", "rename", "parent-fsync"]) {
+    test(`${operation} ${failure} failure preserves memory and restart state`, () => {
+      const filePath = tmpFile();
+      const seed = createRegistry({ filePath, now: () => 1_000_000 });
+      seed.register({ name: "old-owner", port: 20000 });
+      seed.persist();
+
+      const registry = createRegistry({
+        filePath,
+        now: () => 2_000_000,
+        fsImpl: failPersistenceOnce(failure, filePath),
+      });
+      registry.load();
+
+      assert.throws(
+        () =>
+          operation === "register"
+            ? registry.register({ name: "new-owner", port: 20001 })
+            : registry.release(20000),
+        (error) => error.code === "registry_persist_failed" && error.status === 503,
+      );
+
+      assert.equal(registry.getByPort(20000)?.name, "old-owner");
+      assert.equal(registry.getByPort(20001), null);
+
+      const restarted = createRegistry({ filePath, now: () => 3_000_000 });
+      restarted.load();
+      assert.equal(restarted.getByPort(20000)?.name, "old-owner");
+      assert.equal(restarted.getByPort(20001), null);
+      assertOnlyRegistryFileRemains(filePath);
+    });
+  }
+}
+
+test("successful register and release acknowledgements match fresh restart state", () => {
+  const filePath = tmpFile();
+  const registry = createRegistry({ filePath, now: () => 1_000_000 });
+
+  const registered = registry.register({ name: "durable-app", port: 20000 });
+  assert.equal(fs.statSync(filePath).mode & 0o777, 0o600);
+  const afterRegister = createRegistry({ filePath, now: () => 2_000_000 });
+  afterRegister.load();
+  assert.equal(afterRegister.getByPort(20000)?.id, registered.id);
+
+  registry.release(20000);
+  const afterRelease = createRegistry({ filePath, now: () => 3_000_000 });
+  afterRelease.load();
+  assert.equal(afterRelease.getByPort(20000), null);
+  assertOnlyRegistryFileRemains(filePath);
+});
+
+test("load completes a pending rollback after commit and immediate recovery both fail", () => {
+  const filePath = tmpFile();
+  const seed = createRegistry({ filePath, now: () => 1_000_000 });
+  seed.register({ name: "old-owner", port: 20000 });
+
+  const registry = createRegistry({
+    filePath,
+    now: () => 2_000_000,
+    fsImpl: failCommitFsyncAndImmediateRollback(filePath),
+  });
+  registry.load();
+  assert.throws(
+    () => registry.register({ name: "new-owner", port: 20001 }),
+    (error) => error.code === "registry_persist_failed" && error.recoveryPending === true,
+  );
+  assert.equal(registry.getByPort(20000)?.name, "old-owner");
+  assert.equal(fs.existsSync(`${filePath}.rollback`), true);
+  assert.equal(fs.statSync(`${filePath}.rollback`).mode & 0o777, 0o600);
+
+  const restarted = createRegistry({ filePath, now: () => 3_000_000 });
+  restarted.load();
+  assert.equal(restarted.getByPort(20000)?.name, "old-owner");
+  assert.equal(restarted.getByPort(20001), null);
+  assertOnlyRegistryFileRemains(filePath);
+});
+
+test("failed durable replacement preserves a stale foreign owner", () => {
+  const filePath = tmpFile();
+  const seed = createRegistry({ filePath, now: () => 1_000_000 });
+  seed.register({ name: "foreign-owner", port: 20000 });
+  seed.persist();
+
+  const registry = createRegistry({
+    filePath,
+    now: () => 2_000_000,
+    fsImpl: failPersistenceOnce("rename", filePath),
+  });
+  registry.load();
+
+  assert.throws(
+    () => registry.register({ name: "replacement", port: 20000 }),
+    (error) => error.code === "registry_persist_failed",
+  );
+  assert.equal(registry.getByPort(20000)?.name, "foreign-owner");
 });
 
 test("corrupt JSON file is quarantined and registry starts empty", () => {

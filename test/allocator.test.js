@@ -88,13 +88,13 @@ test("preferredPort: registered to another active name is rejected with owner in
   });
 });
 
-test("preferredPort: registered to another but stale is evicted then granted", async () => {
+test("preferredPort: registered to another but stale is retained until durable replacement", async () => {
   const registry = makeFakeRegistry([{ port: 20000, name: "old-app", status: "stale" }]);
   const allocator = createAllocator(baseCtx({ registry }));
 
   const { port } = await allocator.grant({ name: "new-app", preferredPort: 20000 });
   assert.equal(port, 20000);
-  assert.equal(registry.getByPort(20000), null); // evicted
+  assert.equal(registry.getByPort(20000)?.name, "old-app");
 });
 
 test("preferredPort: same name owning the port is not treated as a conflict", async () => {

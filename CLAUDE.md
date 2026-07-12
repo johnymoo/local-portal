@@ -56,9 +56,11 @@ signal handlers — every other module is pure logic wired together by main. The
   live registration**, since a bind attempt can race a service that's mid-restart.
 - **`registry.js`** — the state machine for registered ports: `pending → active ⇄ stale → deleted`.
   It has no timers of its own; `applyScan(listenSet, processInfo, config, nowMs)` is the only thing
-  that advances state, called once per reconcile tick from `main.js`. Persistence is atomic
-  (write `.tmp`, then `rename`); a corrupt/unversioned registry file gets quarantined to
-  `registry.json.corrupt-<epoch>` rather than crashing startup.
+  that advances state, called once per reconcile tick from `main.js`. Register/release persistence
+  is copy-on-write and fail-closed: a same-directory rollback record, file fsync, atomic rename,
+  and parent-directory fsync complete before memory is published or the API returns 2xx. Startup
+  resolves an interrupted transaction from the rollback record. A corrupt/unversioned registry
+  file gets quarantined to `registry.json.corrupt-<epoch>` rather than crashing startup.
 - **`guard.js`** — owns the actual guard listeners. Each guarded port is a *pair* of
   `http.createServer()` instances (`0.0.0.0` + `[::]` with `ipv6Only: true`) — binding only IPv4
   is not enough to guard the port on a host with `net.ipv6.bindv6only=0`, since a v6-only bind can
