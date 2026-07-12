@@ -88,13 +88,31 @@ test("preferredPort: registered to another active name is rejected with owner in
   });
 });
 
-test("preferredPort: registered to another but stale is evicted then granted", async () => {
+test("preferredPort: registered to another but stale is retained until durable replacement", async () => {
   const registry = makeFakeRegistry([{ port: 20000, name: "old-app", status: "stale" }]);
   const allocator = createAllocator(baseCtx({ registry }));
 
   const { port } = await allocator.grant({ name: "new-app", preferredPort: 20000 });
   assert.equal(port, 20000);
-  assert.equal(registry.getByPort(20000), null); // evicted
+  assert.equal(registry.getByPort(20000)?.name, "old-app");
+});
+
+test("preferredPort: stale owner identity is revalidated after the async port probe", async () => {
+  const stale = { id: "reg_old", port: 20000, name: "old-app", status: "stale" };
+  const registry = makeFakeRegistry([stale]);
+  const scanner = {
+    isPortFree: async () => {
+      registry._set({ ...stale, status: "pending" });
+      return true;
+    },
+  };
+  const allocator = createAllocator(baseCtx({ registry, scanner }));
+
+  await assert.rejects(
+    allocator.grant({ name: "new-app", preferredPort: 20000 }),
+    (error) => error.code === "allocation_changed" && error.owner === "old-app",
+  );
+  assert.equal(registry.getByPort(20000)?.status, "pending");
 });
 
 test("preferredPort: same name owning the port is not treated as a conflict", async () => {

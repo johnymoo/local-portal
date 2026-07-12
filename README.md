@@ -26,6 +26,11 @@ npm start
 首次运行会在 `~/.config/local-portal/config.json` 自动创建默认配置。注册数据持久化在
 `~/.local/state/local-portal/registry.json`。
 
+启动加载和首次 mutation 都会先对主 registry 做 descriptor-bound preflight：拒绝 symlink、
+目录、FIFO、非当前用户文件和超限文件。旧部署留下的 current-owner regular registry（例如
+x570 上的 `0664` 文件）会在同一个已验证 fd 上自动收紧为 `0600`，并完成文件 metadata 与
+父目录 `fsync`、inode/path/mode 复核后才继续。迁移任一步失败都会 fail closed，不会确认 mutation。
+
 停止服务：`Ctrl+C` 或 `kill -TERM <pid>` —— 会优雅释放所有守卫端口并写盘。
 
 ## 配置项（`~/.config/local-portal/config.json`）
@@ -55,6 +60,22 @@ npm start
 - `POST /api/release` — `{name, port}` 释放注册
 - `GET /api/agent-guide` — 给 Agent 看的 Markdown 使用指南（`?format=json` 返回 JSON 包裹）
 - `GET /` — 仪表盘（浏览器打开即可看到实时状态）
+
+注册和释放只有在 registry 临时文件、原子替换和父目录都完成 `fsync` 后才返回 2xx。
+持久化失败返回 `503`，错误码为 `registry_persist_failed`，原有内存和磁盘状态保持不变。
+进程若在提交中断，下一次启动会用同目录的内部恢复记录回到最后一个已确认状态。事务期间
+可能出现以下文件（均以 `registry.json` 的完整路径为前缀）：
+
+- `.next`：准备原子替换的下一版 registry snapshot。
+- `.restore`：恢复旧 snapshot 时使用的临时文件。
+- `.rollback.tmp`：尚未原子发布的 rollback 临时文件。
+- `.rollback`：包含旧 snapshot 的持久恢复记录；它存在时，启动恢复以旧状态为准。
+- `.commit.tmp`：尚未原子发布的 commit marker 临时文件。
+- `.commit`：已持久提交的新 snapshot 摘要；成功响应后可能保留到下一次启动或 mutation，
+  届时校验主 registry 后清理。
+
+这些文件属于内部事务协议。不要手工编辑、移动或删除其中任何一个，否则服务会 fail closed，
+并返回 `registry_persist_failed`，而不是猜测应该接受哪个 snapshot。
 
 完整的请求/响应细节、错误码和状态机见各模块源码顶部注释与 `src/api.js`。
 

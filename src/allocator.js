@@ -13,10 +13,9 @@ function isValidPreferredPort(n) {
 /**
  * Port grant logic: preferredPort validation/conflict/eviction, or
  * first-fit auto-allocation over allocRange. Always bind-tests before
- * granting. Does NOT touch the registry's own records other than evicting a
- * stale one that blocks a requested preferredPort — creating the new
- * registration record is the caller's job (see withLock below), so
- * grant+register can be done atomically under one lock hold.
+ * granting. Does not mutate registry records: the caller replaces a stale
+ * owner by writing the new registration (see withLock below), so the complete
+ * ownership decision and durable mutation share one lock hold.
  */
 export function createAllocator({ registry, scanner, guardPorts, allocRange, apiPort, getLastScan, log }) {
   let queue = Promise.resolve();
@@ -33,6 +32,7 @@ export function createAllocator({ registry, scanner, guardPorts, allocRange, api
 
   async function grant({ name, preferredPort }) {
     if (preferredPort !== undefined && preferredPort !== null) {
+      let expectedStaleOwner = null;
       if (!isValidPreferredPort(preferredPort)) {
         throw new AllocError(
           "invalid_port",
@@ -49,10 +49,14 @@ export function createAllocator({ registry, scanner, guardPorts, allocRange, api
       const existing = registry.getByPort(preferredPort);
       if (existing && existing.name !== name) {
         if (existing.status === "stale") {
-          registry.release(preferredPort);
+          expectedStaleOwner = {
+            id: existing.id,
+            name: existing.name,
+            status: existing.status,
+          };
           log?.info?.(
             "allocator",
-            `evicted stale registration ${existing.name}:${preferredPort} to grant it to ${name}`,
+            `stale registration ${existing.name}:${preferredPort} will be durably replaced by ${name}`,
           );
         } else {
           throw new AllocError(
@@ -71,6 +75,28 @@ export function createAllocator({ registry, scanner, guardPorts, allocRange, api
           "port_unmanaged",
           `port ${preferredPort} is occupied by an unmanaged process`,
           { process },
+        );
+      }
+
+      const current = registry.getByPort(preferredPort);
+      if (expectedStaleOwner) {
+        if (
+          !current ||
+          current.id !== expectedStaleOwner.id ||
+          current.name !== expectedStaleOwner.name ||
+          current.status !== expectedStaleOwner.status
+        ) {
+          throw new AllocError(
+            "allocation_changed",
+            `port ${preferredPort} registration changed while availability was checked`,
+            { owner: current?.name ?? null, status: current?.status ?? null },
+          );
+        }
+      } else if (current && current.name !== name) {
+        throw new AllocError(
+          "allocation_changed",
+          `port ${preferredPort} was registered while availability was checked`,
+          { owner: current.name, status: current.status },
         );
       }
 

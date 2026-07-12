@@ -56,8 +56,13 @@ signal handlers — every other module is pure logic wired together by main. The
   live registration**, since a bind attempt can race a service that's mid-restart.
 - **`registry.js`** — the state machine for registered ports: `pending → active ⇄ stale → deleted`.
   It has no timers of its own; `applyScan(listenSet, processInfo, config, nowMs)` is the only thing
-  that advances state, called once per reconcile tick from `main.js`. Persistence is atomic
-  (write `.tmp`, then `rename`); a corrupt/unversioned registry file gets quarantined to
+  that advances state, called once per reconcile tick from `main.js`. Register/release persistence
+  is copy-on-write and fail-closed: a same-directory rollback record, file fsync, atomic rename,
+  and parent-directory fsync complete before memory is published or the API returns 2xx. Startup
+  resolves an interrupted transaction from the rollback record. Main-registry preflight is
+  descriptor-bound and automatically secures current-owner legacy regular files (such as mode
+  `0664`) to `0600` with file/directory fsync and inode/path revalidation; unsafe file types and
+  foreign owners fail closed. A corrupt/unversioned registry file gets quarantined to
   `registry.json.corrupt-<epoch>` rather than crashing startup.
 - **`guard.js`** — owns the actual guard listeners. Each guarded port is a *pair* of
   `http.createServer()` instances (`0.0.0.0` + `[::]` with `ipv6Only: true`) — binding only IPv4
@@ -65,10 +70,10 @@ signal handlers — every other module is pure logic wired together by main. The
   slip past a v4-only guard. A port that's already held by someone else at startup is tracked as
   `wanted` and retried every reconcile tick (`retryWanted(listenSet)`) rather than fought for.
 - **`allocator.js`** — decides *which* port to grant (preferredPort validation/conflict/stale-
-  eviction, or first-fit auto-allocation), but does **not** touch the registry's records itself
-  except to evict a stale conflicting one. It exposes `withLock(fn)` — an async mutex — precisely
-  so that `api.js` can run "decide a port" + "write the registration record" as one atomic unit
-  under a single lock hold and two concurrent `/api/register` calls never land on the same port.
+  replacement eligibility, or first-fit auto-allocation), but does **not** mutate registry records.
+  It exposes `withLock(fn)` — an async mutex — so `api.js` can run same-name re-registration,
+  stale replacement, release, and "decide a port" + "write the registration record" as serialized
+  ownership transactions. Two concurrent requests therefore cannot overwrite the same owner.
 - **`guide.js`** — the single source of truth for every string an agent reads: the guard's 409
   body (JSON and HTML), and the `/api/agent-guide` markdown. `guard.js`, `api.js`, and
   `dashboard.js` all render from here so the wording can't drift out of sync between them.
