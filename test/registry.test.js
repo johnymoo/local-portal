@@ -206,6 +206,58 @@ function failRollbackRemovalOnce(filePath) {
   });
 }
 
+function failCommitCleanupOnce(filePath, stage) {
+  const fdPaths = new Map();
+  let commitRemoved = false;
+  let failed = false;
+  const injected = () => {
+    failed = true;
+    const error = new Error(`injected commit cleanup ${stage} failure`);
+    error.code = "EIO";
+    throw error;
+  };
+  return new Proxy(fs, {
+    get(target, property) {
+      if (property === "openSync") {
+        return (targetPath, flags, mode) => {
+          const fd = target.openSync(targetPath, flags, mode);
+          fdPaths.set(fd, targetPath);
+          return fd;
+        };
+      }
+      if (property === "closeSync") {
+        return (fd) => {
+          fdPaths.delete(fd);
+          return target.closeSync(fd);
+        };
+      }
+      if (property === "unlinkSync") {
+        return (targetPath) => {
+          if (!failed && stage === "unlink" && targetPath === `${filePath}.commit`) injected();
+          const result = target.unlinkSync(targetPath);
+          if (targetPath === `${filePath}.commit`) commitRemoved = true;
+          return result;
+        };
+      }
+      if (property === "fsyncSync") {
+        return (fd) => {
+          if (
+            !failed &&
+            stage === "parent-fsync" &&
+            commitRemoved &&
+            fdPaths.get(fd) === path.dirname(filePath)
+          ) {
+            injected();
+          }
+          return target.fsyncSync(fd);
+        };
+      }
+      const value = Reflect.get(target, property);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
 function failNextClose(filePath, { failFsync = false } = {}) {
   const fdPaths = new Map();
   let fsyncFailed = false;
@@ -365,6 +417,13 @@ function rollbackRecord(content, targetExisted = true) {
     targetExisted,
     contentBase64: Buffer.from(content, "utf8").toString("base64"),
     sha256: crypto.createHash("sha256").update(content).digest("hex"),
+  })}\n`;
+}
+
+function commitRecord(content) {
+  return `${JSON.stringify({
+    commitVersion: 1,
+    snapshotSha256: crypto.createHash("sha256").update(content).digest("hex"),
   })}\n`;
 }
 
@@ -644,24 +703,39 @@ test("successful register and release acknowledgements match fresh restart state
 
   const registered = registry.register({ name: "durable-app", port: 20000 });
   assert.equal(fs.statSync(filePath).mode & 0o777, 0o600);
-  assert.equal(fs.statSync(`${filePath}.commit`).mode & 0o777, 0o600);
+  assert.equal(fs.existsSync(`${filePath}.commit`), false);
   const afterRegister = createRegistry({ filePath, now: () => 2_000_000 });
   afterRegister.load();
   assert.equal(afterRegister.getByPort(20000)?.id, registered.id);
   assert.equal(fs.existsSync(`${filePath}.commit`), false);
 
   registry.release(20000);
-  assert.equal(fs.existsSync(`${filePath}.commit`), true);
+  assert.equal(fs.existsSync(`${filePath}.commit`), false);
   const afterRelease = createRegistry({ filePath, now: () => 3_000_000 });
   afterRelease.load();
   assert.equal(afterRelease.getByPort(20000), null);
   assertOnlyRegistryFileRemains(filePath);
 });
 
+test("successful transaction leaves no stale commit marker for an old writer rewrite", () => {
+  const filePath = tmpFile();
+  const registry = createRegistry({ filePath, now: () => 1_000_000 });
+  registry.register({ name: "new-writer", port: 20000 });
+
+  assert.equal(fs.existsSync(`${filePath}.commit`), false);
+  fs.writeFileSync(filePath, registrySnapshot("old-writer"), { mode: 0o600 });
+
+  const restarted = createRegistry({ filePath, now: () => 2_000_000 });
+  restarted.load();
+  assert.equal(restarted.getByPort(20000)?.name, "old-writer");
+});
+
 test("commit-only recovery rejects a main snapshot replaced before marker cleanup", () => {
   const filePath = tmpFile();
   const seed = createRegistry({ filePath, now: () => 1_000_000 });
   seed.register({ name: "committed-owner", port: 20000 });
+  const committedSnapshot = fs.readFileSync(filePath, "utf8");
+  fs.writeFileSync(`${filePath}.commit`, commitRecord(committedSnapshot), { mode: 0o600 });
   assert.equal(fs.existsSync(`${filePath}.commit`), true);
 
   const replacementPath = `${filePath}.replacement`;
@@ -696,6 +770,25 @@ test("commit-only recovery rejects a main snapshot replaced before marker cleanu
   assert.throws(
     () => registry.load(),
     (error) => error.code === "registry_persist_failed" && /changed after it was read/.test(error.message),
+  );
+  assert.equal(registry.all().length, 0);
+  assert.equal(fs.existsSync(`${filePath}.commit`), true);
+});
+
+test("commit-only recovery rejects a snapshot checksum mismatch", () => {
+  const filePath = tmpFile();
+  const seed = createRegistry({ filePath, now: () => 1_000_000 });
+  seed.register({ name: "committed-owner", port: 20000 });
+  const committedSnapshot = fs.readFileSync(filePath, "utf8");
+  fs.writeFileSync(`${filePath}.commit`, commitRecord(committedSnapshot), { mode: 0o600 });
+  fs.writeFileSync(filePath, registrySnapshot("replaced-owner"), { mode: 0o600 });
+
+  const registry = createRegistry({ filePath });
+  assert.throws(
+    () => registry.load(),
+    (error) =>
+      error.code === "registry_persist_failed" &&
+      /committed registry snapshot checksum mismatch/.test(error.message),
   );
   assert.equal(registry.all().length, 0);
   assert.equal(fs.existsSync(`${filePath}.commit`), true);
@@ -752,6 +845,34 @@ test("rollback removal failure keeps the old snapshot recoverable", () => {
   assert.equal(restarted.getByPort(20001), null);
   assertOnlyRegistryFileRemains(filePath);
 });
+
+for (const stage of ["unlink", "parent-fsync"]) {
+  test(`commit marker cleanup ${stage} failure keeps the old snapshot recoverable`, () => {
+    const filePath = tmpFile();
+    const seed = createRegistry({ filePath, now: () => 1_000_000 });
+    seed.register({ name: "old-owner", port: 20000 });
+
+    const registry = createRegistry({
+      filePath,
+      now: () => 2_000_000,
+      fsImpl: failCommitCleanupOnce(filePath, stage),
+    });
+    registry.load();
+    assert.throws(
+      () => registry.register({ name: "new-owner", port: 20001 }),
+      (error) => error.code === "registry_persist_failed" && error.recoveryPending === true,
+    );
+    assert.equal(registry.getByPort(20000)?.name, "old-owner");
+    assert.equal(registry.getByPort(20001), null);
+    assert.equal(fs.existsSync(`${filePath}.rollback`), true);
+
+    const restarted = createRegistry({ filePath, now: () => 3_000_000 });
+    restarted.load();
+    assert.equal(restarted.getByPort(20000)?.name, "old-owner");
+    assert.equal(restarted.getByPort(20001), null);
+    assertOnlyRegistryFileRemains(filePath);
+  });
+}
 
 for (const restoreFailure of ["rename", "fsync"]) {
   test(`post-unlink failure with immediate restore ${restoreFailure} failure keeps old-state evidence`, () => {

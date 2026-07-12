@@ -479,6 +479,9 @@ export function createRegistry({ filePath, log, now = () => Date.now(), fsImpl =
 
       fsImpl.unlinkSync(rollbackPath);
       fsyncDirectory();
+
+      fsImpl.unlinkSync(commitPath);
+      fsyncDirectory();
       cleanupStagingFiles();
     } catch (err) {
       log?.error?.("registry", `failed to persist registry: ${err.message}`);
